@@ -22,6 +22,15 @@ from trecrag.rerank.cross_encoder import (
 )
 from trecrag.rerank.llm_listwise import LLMListwiseReranker
 from trecrag.rerank.ltr import LTRReranker
+from trecrag.rerank.qder import (
+    EntityEmbeddingProvider,
+    HashingQDERScorer,
+    HeuristicEntityProvider,
+    NullEntityProvider,
+    QDERReranker,
+    QDERScorer,
+    TransformerQDERScorer,
+)
 from trecrag.retrieval.biencoder import BiencoderRetriever, Encoder, HashingEncoder, SentenceTransformerEncoder
 from trecrag.retrieval.bm25 import BM25Retriever
 
@@ -94,6 +103,43 @@ def build_colbert(colbert_cfg: dict[str, Any]) -> ColBERTReranker | None:
     )
 
 
+def build_qder(qder_cfg: dict[str, Any]) -> QDERReranker | None:
+    if not qder_cfg.get("enabled", True):
+        return None
+
+    use_entities = bool(qder_cfg.get("use_entities", False))
+    entity_provider: EntityEmbeddingProvider
+    if use_entities and qder_cfg.get("entity_provider", "none") == "heuristic":
+        entity_provider = HeuristicEntityProvider()
+    else:
+        entity_provider = NullEntityProvider()
+
+    scorer: QDERScorer
+    if qder_cfg.get("backend", "hashing") == "transformer":
+        scorer = TransformerQDERScorer(
+            model_name=qder_cfg["model_name"],
+            use_entities=use_entities,
+            entity_provider=entity_provider,
+            score_method=qder_cfg.get("score_method", "bilinear"),
+            model_path=qder_cfg.get("model_path"),
+            max_query_tokens=int(qder_cfg.get("max_query_tokens", 32)),
+            max_doc_tokens=int(qder_cfg.get("max_doc_tokens", 256)),
+        )
+    else:
+        scorer = HashingQDERScorer(
+            entity_provider=entity_provider,
+            max_query_tokens=int(qder_cfg.get("max_query_tokens", 32)),
+            max_doc_tokens=int(qder_cfg.get("max_doc_tokens", 256)),
+        )
+
+    hybrid_lambda = qder_cfg.get("hybrid_lambda", 0.5)
+    return QDERReranker(
+        scorer,
+        bm25_feature_name=qder_cfg.get("bm25_feature_name", "bm25_score"),
+        hybrid_lambda=None if hybrid_lambda is None else float(hybrid_lambda),
+    )
+
+
 def build_cross_encoder(ce_cfg: dict[str, Any]) -> CrossEncoderReranker | None:
     if not ce_cfg.get("enabled", True):
         return None
@@ -131,6 +177,7 @@ def build_pipeline_from_config(config: dict[str, Any]) -> RagPipeline:
     hybrid_cfg = stages.get("hybrid", {})
     ltr_cfg = stages.get("ltr", {})
     colbert_cfg = stages.get("colbert", {})
+    qder_cfg = stages.get("qder", {})
     ce_cfg = stages.get("cross_encoder", {})
     listwise_cfg = stages.get("llm_listwise", {})
     generation_cfg = config["generation"]
@@ -144,6 +191,7 @@ def build_pipeline_from_config(config: dict[str, Any]) -> RagPipeline:
         rrf_k=int(hybrid_cfg.get("rrf_k", 60)),
         ltr_top_k=int(ltr_cfg.get("top_k", 200)),
         colbert_top_k=int(colbert_cfg.get("top_k", 100)),
+        qder_top_k=int(qder_cfg.get("top_k", 80)),
         ce_top_k=int(ce_cfg.get("top_k", 50)),
         llm_listwise_top_k=int(listwise_cfg.get("top_k", 20)),
     )
@@ -161,6 +209,7 @@ def build_pipeline_from_config(config: dict[str, Any]) -> RagPipeline:
         biencoder=build_biencoder(stages.get("biencoder", {})),
         ltr=build_ltr(ltr_cfg),
         colbert=build_colbert(colbert_cfg),
+        qder=build_qder(qder_cfg),
         cross_encoder=build_cross_encoder(ce_cfg),
         llm_listwise=build_llm_listwise(listwise_cfg, llm_cfg),
     )

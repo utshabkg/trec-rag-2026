@@ -11,6 +11,7 @@ from trecrag.rerank.colbert import ColBERTReranker, HashingTokenEncoder
 from trecrag.rerank.cross_encoder import CrossEncoderReranker, LexicalOverlapScorer
 from trecrag.rerank.llm_listwise import LLMListwiseReranker
 from trecrag.rerank.ltr import LTRReranker
+from trecrag.rerank.qder import HashingQDERScorer, QDERReranker
 from trecrag.retrieval.biencoder import BiencoderRetriever, HashingEncoder
 from trecrag.schema import Candidate, Topic
 from trecrag.validate import validate_rag_jsonl, validate_retrieval_run
@@ -42,6 +43,7 @@ def _build_pipeline() -> RagPipeline:
             weights={"bm25_score": 0.3, "bien_score": 0.3, "rrf_score": 0.4},
         ),
         colbert=ColBERTReranker(HashingTokenEncoder(dims=128)),
+        qder=QDERReranker(HashingQDERScorer(), hybrid_lambda=0.5),
         cross_encoder=CrossEncoderReranker(LexicalOverlapScorer()),
         llm_listwise=LLMListwiseReranker(IdentityLLMClient(), window_size=5, step=3),
         generator=ExtractiveGenerator(),
@@ -50,6 +52,7 @@ def _build_pipeline() -> RagPipeline:
             hybrid_top_k=8,
             ltr_top_k=6,
             colbert_top_k=5,
+            qder_top_k=4,
             ce_top_k=4,
             llm_listwise_top_k=3,
         ),

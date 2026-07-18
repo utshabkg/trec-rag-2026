@@ -43,6 +43,22 @@ stages:
     max_doc_tokens: 180
     top_k: 100
 
+  # QDER (plans/qder-approach.md): query-guided text+entity attention, Add &
+  # Multiply interactions, bilinear scoring. See src/trecrag/rerank/qder/.
+  qder:
+    enabled: true
+    backend: hashing            # hashing | transformer
+    model_name: "bert-base-uncased"   # only used when backend: transformer
+    model_path: null            # trained checkpoint from SIGIR2025-QDER's src/doc_ranking/train.py; null = untrained
+    score_method: bilinear      # linear | bilinear (transformer backend only)
+    use_entities: false         # entity channel needs an EntityEmbeddingProvider (no WAT/Wikipedia2Vec for ClimbMix here)
+    entity_provider: heuristic  # none | heuristic (capitalized-phrase spotting + hashed vectors; only used if use_entities: true)
+    bm25_feature_name: bm25_score   # upstream Candidate.features key used as QDER's external relevance signal `s`
+    hybrid_lambda: 0.5          # score_hybrid = lambda*bm25 + (1-lambda)*qder; null disables interpolation (fixed stand-in for the paper's coordinate-ascent-tuned lambda)
+    max_query_tokens: 32
+    max_doc_tokens: 256
+    top_k: 80
+
   cross_encoder:
     enabled: true
     backend: lexical            # lexical | sentence_transformer

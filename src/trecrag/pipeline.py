@@ -1,7 +1,14 @@
 """Orchestrates the full cascade:
 
-    (BM25 + Biencoder) -> Hybrid RRF fusion -> LTR -> ColBERT -> CE
+    (BM25 + Biencoder) -> Hybrid RRF fusion -> LTR -> ColBERT -> QDER -> CE
         -> LLM listwise -> final ranked list -> Generator
+
+QDER (see plans/qder-approach.md) sits right after ColBERT: it extends
+ColBERT's late-interaction idea with query-guided text+entity attention and a
+bilinear scorer, so it belongs where a heavier, more precise multi-vector
+reranker naturally slots into an increasingly-expensive cascade — after the
+cheap token-level ColBERT pass narrows the pool, before the pairwise
+cross-encoder.
 
 Every stage after BM25 is optional (`None` skips it, simply truncating to
 that stage's configured depth) so partial pipelines can be assembled and
@@ -26,6 +33,7 @@ class StageDepths:
     hybrid_top_k: int = 500
     ltr_top_k: int = 200
     colbert_top_k: int = 100
+    qder_top_k: int = 80
     ce_top_k: int = 50
     llm_listwise_top_k: int = 20
     rrf_k: int = 60
@@ -48,6 +56,7 @@ class RagPipeline:
         biencoder: BiencoderRetriever | None = None,
         ltr: Reranker | None = None,
         colbert: Reranker | None = None,
+        qder: Reranker | None = None,
         cross_encoder: Reranker | None = None,
         llm_listwise: Reranker | None = None,
     ):
@@ -55,6 +64,7 @@ class RagPipeline:
         self.biencoder = biencoder
         self.ltr = ltr
         self.colbert = colbert
+        self.qder = qder
         self.cross_encoder = cross_encoder
         self.llm_listwise = llm_listwise
         self.generator = generator
@@ -85,6 +95,11 @@ class RagPipeline:
             candidates = self.colbert.rerank(topic, candidates, self.depths.colbert_top_k)
         else:
             candidates = candidates[: self.depths.colbert_top_k]
+
+        if self.qder is not None:
+            candidates = self.qder.rerank(topic, candidates, self.depths.qder_top_k)
+        else:
+            candidates = candidates[: self.depths.qder_top_k]
 
         if self.cross_encoder is not None:
             candidates = self.cross_encoder.rerank(topic, candidates, self.depths.ce_top_k)

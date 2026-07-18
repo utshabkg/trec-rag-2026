@@ -3,14 +3,15 @@
 TREC RAG 2026 submission pipeline for the RAG (`RAG`) task, implementing:
 
 ```
-Query --> (BM25 + Biencoder) --> LTR --> ColBERT --> CE --> LLM Listwise --> Final Ranked-List --> Generator
+Query --> (BM25 + Biencoder) --> LTR --> ColBERT --> QDER --> CE --> LLM Listwise --> Final Ranked-List --> Generator
 ```
 
 Retrieves from NVIDIA's ClimbMix-400b corpus via the official Pyserini REST
-API, cascades through five reranking stages, and generates a sentence-cited,
+API, cascades through six reranking stages, and generates a sentence-cited,
 word/citation-bounded answer per the TREC RAG 2026 track guidelines. See
 `../plans/trec-rag-2026-participation-guide.md` for the full task/format
-writeup this implementation targets.
+writeup this implementation targets, and `../plans/qder-approach.md` for the
+QDER reranking stage's approach.
 
 ## Design principle: every stage runs with zero setup
 
@@ -27,6 +28,7 @@ become available; nothing else changes.
 | Biencoder | hashing-trick bag-of-words cosine | `sentence-transformers` (`neural` extra) |
 | LTR | per-feature min-max weighted linear sum | LightGBM LambdaMART (`ltr` extra), see `scripts/train_ltr.py` |
 | ColBERT | hashed one-hot token MaxSim | HF transformer token embeddings + MaxSim (`neural` extra) |
+| QDER | hashed text (+ optional heuristic entity) channels, untrained bilinear scorer | vendored `QDERModel` (BERT text channel, `neural` extra), see below |
 | Cross-encoder | lexical token-overlap scorer | `sentence_transformers.CrossEncoder` (`neural` extra) |
 | LLM listwise | identity (keeps input order) | OpenAI-compatible or Anthropic client (`llm` extra) |
 | Generator | extractive (best query-overlap sentence per doc) | LLM JSON-cited generator with extractive fallback on parse failure |
@@ -49,6 +51,7 @@ src/trecrag/
   rerank/
     ltr.py                       Learning-to-rank fusion of upstream features
     colbert.py                   Late-interaction MaxSim reranking
+    qder/                        Query-specific Doc/Entity Representations reranking (see below)
     cross_encoder.py            Joint (query, passage) scoring
     llm_listwise.py             RankGPT-style sliding-window listwise reranking
   generation/
@@ -132,6 +135,41 @@ python scripts/train_ltr.py \
 
 Then set `stages.ltr.model_path` in `configs/pipeline.yaml` to the saved model.
 
+## The QDER stage
+
+`src/trecrag/rerank/qder/` implements QDER (see `../plans/qder-approach.md`):
+query-guided attention over a text channel (and an optional entity channel),
+Addition + Multiplication interaction patterns, mean-pooled and scaled by an
+upstream retrieval score, combined via a bilinear scorer — then optionally
+interpolated with the upstream BM25-like score (`stages.qder.hybrid_lambda`,
+a fixed stand-in for the paper's coordinate-ascent-tuned λ).
+
+- `_vendor/` is vendored **unmodified** from `SIGIR2025-QDER` (`src/doc_ranking/base_model.py`,
+  `text_embedding.py`, `qder_model.py`, main branch) — only the two local
+  imports in `qder_model.py` were adjusted to this package's layout. This is
+  the real BERT-based `QDERModel`, used by `TransformerQDERScorer`.
+- `entities.py` defines `EntityEmbeddingProvider`. Real entity linking (WAT)
+  and Wikipedia2Vec embeddings for ClimbMix aren't available here, so
+  `use_entities` defaults to `false`. `HeuristicEntityProvider` (capitalized-
+  phrase spotting + hashed vectors) is a dependency-free stand-in that
+  exercises the entity channel's code path when `use_entities: true`; swap in
+  a real linker + embedding table for production use.
+- `reranker.py` has `HashingQDERScorer` (default fallback — same architecture,
+  hashed vectors, untrained/identity bilinear matrix) and `TransformerQDERScorer`
+  (wraps the vendored `QDERModel`; pass `model_path` to load a checkpoint
+  trained with SIGIR2025-QDER's own `src/doc_ranking/train.py` — that
+  training pipeline was intentionally not re-implemented here).
+
+To use a trained checkpoint, set in `configs/pipeline.yaml`:
+
+```yaml
+stages:
+  qder:
+    backend: transformer
+    model_name: "bert-base-uncased"   # must match the checkpoint's encoder
+    model_path: "/path/to/qder_checkpoint.bin"
+```
+
 ## Tests
 
 ```bash
@@ -148,10 +186,16 @@ network, GPU, or API keys required. If `pytest` is installed (`pip install
 
 - `stages.ltr.model_path` ships unset (linear fallback); train one with
   `scripts/train_ltr.py` against dev qrels for a real learned ranker.
-- `stages.colbert.backend` / `stages.cross_encoder.backend` /
+- `stages.colbert.backend` / `stages.qder.backend` / `stages.cross_encoder.backend` /
   `stages.llm_listwise.backend` default to the dependency-free fallbacks;
   flip to `transformer` / `sentence_transformer` / `openai`|`anthropic`
   once compute/API budget is available, per `configs/pipeline.yaml`.
+- `stages.qder.use_entities` ships `false` (no WAT linker / Wikipedia2Vec
+  table for ClimbMix); `HeuristicEntityProvider` is a rough proxy if you want
+  to exercise the entity channel before wiring in a real one.
+- `stages.qder.hybrid_lambda` is a fixed config value, not the paper's
+  coordinate-ascent-tuned λ — no training/tuning infrastructure for that is
+  wired up here.
 - Submission logistics (upload portal, exact deadline) are still unconfirmed
   upstream — see `../plans/trec-rag-2026-participation-guide.md` §6–7 before
   the real submission.
