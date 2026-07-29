@@ -34,9 +34,27 @@ class TestLLMListwiseReranker(unittest.TestCase):
         reranker = LLMListwiseReranker(IdentityLLMClient())
         self.assertEqual(reranker.rerank(Topic("t1", "q"), [], k=5), [])
 
-    def test_parse_order_ignores_malformed_response(self):
-        order = LLMListwiseReranker._parse_order("not a real ranking", n=3)
-        self.assertEqual(order, [0, 1, 2])
+    def test_parse_order_rejects_a_response_that_is_not_a_ranking(self):
+        """None means 'keep the upstream order', not 'here is a ranking'.
+
+        Back-filling a prose reply into a full permutation would present noise as
+        a confident reordering of the last stage before the run file."""
+        self.assertIsNone(LLMListwiseReranker._parse_order("not a real ranking", n=3))
+
+    def test_parse_order_ignores_list_numbering(self):
+        """"1. [7]" must rank passage 7 first -- not passage 1."""
+        order = LLMListwiseReranker._parse_order("1. [7]\n2. [3]\n3. [5]", n=8)
+        self.assertEqual(order[:3], [6, 2, 4])
+
+    def test_parse_order_ignores_digits_in_prose(self):
+        order = LLMListwiseReranker._parse_order(
+            "[7] > [3] > [5] because 2 of 3 criteria are met", n=8
+        )
+        self.assertEqual(order[:3], [6, 2, 4])
+
+    def test_parse_order_falls_back_to_bare_integers(self):
+        order = LLMListwiseReranker._parse_order("3 > 1 > 2", n=3)
+        self.assertEqual(order, [2, 0, 1])
 
     def test_parse_order_appends_missing_indices(self):
         order = LLMListwiseReranker._parse_order("[2] > [1]", n=3)

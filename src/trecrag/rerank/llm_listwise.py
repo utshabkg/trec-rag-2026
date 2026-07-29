@@ -12,9 +12,13 @@ from __future__ import annotations
 import re
 
 from trecrag.clients.llm_client import LLMClient
+from trecrag.logging_utils import get_logger
 from trecrag.rerank.base import Reranker
 from trecrag.schema import Candidate, Topic
 
+logger = get_logger("llm_listwise")
+
+_BRACKETED_RE = re.compile(r"\[(\d+)\]")
 _INT_RE = re.compile(r"\d+")
 
 
@@ -60,8 +64,16 @@ class LLMListwiseReranker(Reranker):
     def _rank_window(self, query: str, window: list[Candidate]) -> list[Candidate]:
         if len(window) <= 1:
             return window
-        response = self.llm.complete(self._build_prompt(query, window), max_tokens=256)
+        # 256 tokens truncates a 20-item permutation for chattier models, and a
+        # truncated reasoning block leaves its digits in the string to be parsed.
+        response = self.llm.complete(self._build_prompt(query, window), max_tokens=512)
         order = self._parse_order(response, len(window))
+        if order is None:
+            logger.warning(
+                "listwise: unparsable ordering for a %d-passage window; keeping input order",
+                len(window),
+            )
+            return window
         return [window[i] for i in order]
 
     def _build_prompt(self, query: str, window: list[Candidate]) -> str:
@@ -79,15 +91,39 @@ class LLMListwiseReranker(Reranker):
         return "\n".join(lines)
 
     @staticmethod
-    def _parse_order(response: str, n: int) -> list[int]:
-        found = [int(match) - 1 for match in _INT_RE.findall(response)]
+    def _parse_order(response: str, n: int) -> list[int] | None:
+        """Parse the model's permutation, or None if the reply isn't one.
+
+        The prompt asks for "[3] > [1] > [2]", so bracketed indices are the
+        signal. Reading every bare integer instead silently corrupts the ranking
+        whenever the model numbers its list ("1. [7]" -> 1 outranks 7) or explains
+        itself in prose -- and since missing indices are back-filled, the result
+        is always a *valid* permutation, so nothing ever errors or logs.
+        """
+        matches = _BRACKETED_RE.findall(response)
+        bracketed = bool(matches)
+        if not bracketed:
+            # No brackets at all: fall back to bare integers, which is still right
+            # for a terse reply like "3 > 1 > 2".
+            matches = _INT_RE.findall(response)
+
         order: list[int] = []
         seen: set[int] = set()
-        for idx in found:
+        for match in matches:
+            idx = int(match) - 1
             if 0 <= idx < n and idx not in seen:
                 order.append(idx)
                 seen.add(idx)
-        for idx in range(n):
-            if idx not in seen:
-                order.append(idx)
+
+        if not order:
+            return None
+        # Bracketed indices mean the model answered in the requested format, so
+        # even a partial ranking is signal and the rest is back-filled. Bare
+        # integers are only trustworthy when they cover most of the window --
+        # otherwise we are reading digits out of prose, and back-filling would
+        # dress that noise up as a confident reordering.
+        if not bracketed and len(order) * 2 < n:
+            return None
+
+        order.extend(idx for idx in range(n) if idx not in seen)
         return order
