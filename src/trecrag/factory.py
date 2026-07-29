@@ -56,6 +56,8 @@ def build_pyserini_client(config: dict[str, Any]) -> PyseriniClient:
         token=get_env(pyserini_config.get("token_env")),
         timeout_seconds=float(pyserini_config.get("timeout_seconds", 20)),
         max_retries=int(pyserini_config.get("max_retries", 3)),
+        cache_dir=pyserini_config.get("cache_dir"),
+        backoff_factor=float(pyserini_config.get("backoff_factor", 0.5)),
     )
 
 
@@ -64,7 +66,13 @@ def build_biencoder(biencoder_cfg: dict[str, Any]) -> BiencoderRetriever | None:
         return None
     encoder: Encoder
     if biencoder_cfg.get("backend", "hashing") == "sentence_transformer":
-        encoder = SentenceTransformerEncoder(biencoder_cfg["model_name"])
+        encoder = SentenceTransformerEncoder(
+            biencoder_cfg["model_name"],
+            device=biencoder_cfg.get("device"),
+            batch_size=int(biencoder_cfg.get("batch_size", 128)),
+            query_prefix=biencoder_cfg.get("query_prefix", ""),
+            passage_prefix=biencoder_cfg.get("passage_prefix", ""),
+        )
     else:
         encoder = HashingEncoder(dims=int(biencoder_cfg.get("dims", 768)))
     return BiencoderRetriever(encoder, pool_size=int(biencoder_cfg.get("pool_size", 1000)))
@@ -84,7 +92,11 @@ def build_colbert(colbert_cfg: dict[str, Any]) -> ColBERTReranker | None:
     if not colbert_cfg.get("enabled", True):
         return None
     if colbert_cfg.get("backend", "hashing") == "transformer":
-        token_encoder = TransformerTokenEncoder(colbert_cfg["model_name"])
+        token_encoder = TransformerTokenEncoder(
+            colbert_cfg["model_name"],
+            device=colbert_cfg.get("device"),
+            batch_size=int(colbert_cfg.get("batch_size", 32)),
+        )
     else:
         token_encoder = HashingTokenEncoder()
     return ColBERTReranker(
@@ -98,7 +110,11 @@ def build_cross_encoder(ce_cfg: dict[str, Any]) -> CrossEncoderReranker | None:
     if not ce_cfg.get("enabled", True):
         return None
     if ce_cfg.get("backend", "lexical") == "sentence_transformer":
-        scorer = SentenceTransformersCrossEncoderScorer(ce_cfg["model_name"])
+        scorer = SentenceTransformersCrossEncoderScorer(
+            ce_cfg["model_name"],
+            device=ce_cfg.get("device"),
+            batch_size=int(ce_cfg.get("batch_size", 64)),
+        )
     else:
         scorer = LexicalOverlapScorer()
     return CrossEncoderReranker(scorer)
