@@ -53,12 +53,19 @@ def select_passage(
     windows_per_doc: int = 2,
     joiner: str = " ... ",
 ) -> str:
-    """Return the most query-relevant span(s) of `text`, in document order.
+    """Return the most query-relevant span(s) of `text`, best span first.
 
     Taking more than one window matters here because the narratives are
     multi-faceted: a single span often answers one sub-question while another
-    sits elsewhere in the same document. Selected windows are non-overlapping,
-    and are re-joined in document order so the passage still reads forwards.
+    sits elsewhere in the same document. Selected windows are non-overlapping.
+
+    Ordering is by score, NOT by document position, because every consumer
+    truncates: the biencoder and cross-encoder cap at 2000 chars and the
+    listwise reranker at 1200, so with `window_chars: 2000` they only ever see
+    the first window. Joining in document order therefore handed the rerankers
+    the *lower*-scoring window in 52% of two-window documents (measured over 299
+    real ClimbMix candidates) -- silently worse than selecting one window. Score
+    order makes truncation lossy in the harmless direction.
     """
     windows = iter_windows(text, window_chars, stride_chars)
     if not windows:
@@ -76,7 +83,8 @@ def select_passage(
             continue  # overlaps something already taken; skip to add new material
         chosen.append((offset, window))
 
-    chosen.sort(key=lambda ow: ow[0])
+    # `ranked` is already score-descending and `chosen` preserves that order, so
+    # the best window leads and survives any downstream truncation.
     return joiner.join(window for _, window in chosen)
 
 

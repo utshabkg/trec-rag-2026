@@ -115,8 +115,23 @@ class LLMGenerator(Generator):
             '"text" and "citations".',
             "Identify every distinct sub-question the request asks and address each "
             "one explicitly; breadth of coverage matters more than depth on any "
-            "single point. If the evidence does not cover a sub-question, say so "
-            "rather than inventing an answer.",
+            "single point.",
+            # Each of these was an observed failure in a real 119-narrative run.
+            "Write the answer itself. Do not restate or summarise the question, and "
+            "do not describe what the request is asking -- 21 of 119 answers opened "
+            "with 'The question asks...', which wastes the word budget and reads "
+            "poorly to a judge.",
+            "Never mention the evidence passages as objects. Write 'Subletting can "
+            "be a viable option', not 'Passage [6] notes that subletting...'. The "
+            "citation field carries attribution; the prose must not.",
+            "Answer in the register the request asks for: if it asks for an outline, "
+            "a blog post, a script or a one-pager, produce that artefact rather than "
+            "describing what one would contain.",
+            "Address the person's stated situation and constraints directly, using "
+            "their terms.",
+            "Where the evidence is thin, give the best conditional guidance it "
+            "supports ('prioritise X if A, otherwise Y') instead of stating that the "
+            "evidence is insufficient.",
             f'"citations" must be a list of at most {max_citations} zero-based indices '
             "into the evidence passages above, ordered strongest support first.",
             "Every sentence must be supported by at least one cited passage. Do not "

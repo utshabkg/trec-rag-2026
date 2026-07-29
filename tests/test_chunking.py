@@ -8,7 +8,7 @@ exactly what was happening before.
 
 import unittest
 
-from trecrag.chunking import PassageSelector, iter_windows, select_passage
+from trecrag.chunking import PassageSelector, _score, iter_windows, select_passage
 from trecrag.schema import Candidate
 from trecrag.text_utils import tokenize
 
@@ -73,16 +73,26 @@ class TestSelectPassage(unittest.TestCase):
         self.assertIn("pipeline partnerships", selected.lower())
         self.assertIn("accountability", selected.lower())
 
-    def test_selected_windows_stay_in_document_order(self):
-        early = "Alpha keyword sentence. " * 3
-        late = "Alpha keyword sentence again. " * 3
-        doc = early + FILLER + late
+    def test_best_window_leads_so_truncation_is_harmless(self):
+        """Every consumer truncates -- rerankers at 2000 chars, listwise at 1200 --
+        so whatever leads is all they see. Ordering by document position instead
+        of score handed the rerankers the lower-scoring window in 52% of
+        two-window documents, measured on real ClimbMix candidates."""
+        weak = "Alpha mentioned once. " * 3
+        strong = "Alpha keyword target alpha keyword target. " * 6
+        doc = weak + FILLER + strong  # the better span sits LAST in the document
+        query_tokens = set(tokenize("alpha keyword target"))
+
         selected = select_passage(
-            doc, set(tokenize("alpha keyword")), window_chars=300, stride_chars=150, windows_per_doc=2
+            doc, query_tokens, window_chars=300, stride_chars=150, windows_per_doc=2
         )
-        parts = selected.split(" ... ")
-        if len(parts) == 2:
-            self.assertLess(doc.index(parts[0][:40]), doc.index(parts[1][:40]))
+        lead = selected.split(" ... ")[0]
+
+        best = max(
+            (_score(w, query_tokens) for _, w in iter_windows(doc, 300, 150)),
+            default=0.0,
+        )
+        self.assertAlmostEqual(_score(lead, query_tokens), best, places=6)
 
     def test_empty_query_tokens_returns_something_usable(self):
         doc = FILLER
