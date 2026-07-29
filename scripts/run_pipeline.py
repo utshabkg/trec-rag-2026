@@ -137,13 +137,27 @@ def main() -> None:
                 build_rag_record(args.team_id, topic, args.run_id, args.run_desc, rag_answer)
             )
 
+    # A partial run must never overwrite a complete submission. --limit slices
+    # `topics`, so `missing` is computed over the slice and comes back empty --
+    # a 5-topic smoke test would otherwise truncate a finished 119-topic
+    # submission in place and exit 0 reporting success.
+    all_topic_ids = {t.topic_id for t in load_topics(args.topics)}
+    is_complete = not missing and {t.topic_id for t in topics} == all_topic_ids
+    suffix = "" if is_complete else ".partial"
+    if not is_complete:
+        logger.warning(
+            "Partial run (%d of %d narratives): writing '*%s' instead of the official "
+            "filenames so a complete submission is never overwritten.",
+            len(topics), len(all_topic_ids), suffix,
+        )
+
     if args.task in ("retrieval", "both"):
-        retrieval_path = out_dir / config["retrieval_output"]["filename"]
+        retrieval_path = out_dir / (config["retrieval_output"]["filename"] + suffix)
         write_retrieval_run(retrieval_path, args.run_id, retrieval_results)
         logger.info("Wrote retrieval run: %s (%d topics)", retrieval_path, len(retrieval_results))
 
     if args.task in ("rag", "both"):
-        rag_path = out_dir / config["generation"]["filename"]
+        rag_path = out_dir / (config["generation"]["filename"] + suffix)
         write_rag_jsonl(rag_path, rag_records)
         logger.info("Wrote RAG output: %s (%d topics)", rag_path, len(rag_records))
 
