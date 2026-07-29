@@ -73,14 +73,23 @@ class LLMGenerator(Generator):
             return RagAnswer(references=[], sentences=[])
 
         prompt = self._build_prompt(topic, usable, max_words, max_citations)
-        response = self.llm.complete(prompt, max_tokens=2048)
+        # A 1024-word cited answer is ~1900 tokens of JSON; 2048 truncated the
+        # array often enough that the parse failed and silently dropped to the
+        # extractive fallback.
+        response = self.llm.complete(prompt, max_tokens=4096)
         parsed = self._parse_response(response, len(usable))
         if parsed is None:
             return self.fallback.generate(topic, evidence, max_words, max_citations)
 
         references = [c.docid for c in usable]
         sentences = [AnswerSentence(text=s["text"], citations=s["citations"]) for s in parsed]
-        return postprocess_rag_answer(references, sentences, max_words, max_citations)
+        answer = postprocess_rag_answer(references, sentences, max_words, max_citations)
+        if not answer.sentences:
+            # Parsed fine but nothing survived post-processing (e.g. every
+            # citation was unusable), which would submit an empty answer and
+            # score zero for this narrative. An extractive answer beats none.
+            return self.fallback.generate(topic, evidence, max_words, max_citations)
+        return answer
 
     @staticmethod
     def _build_prompt(
@@ -94,13 +103,22 @@ class LLMGenerator(Generator):
             "Evidence passages:",
         ]
         for i, candidate in enumerate(usable):
-            lines.append(f"[{i}] {(candidate.text or '')[:1500]}")
+            lines.append(f"[{i}] {(candidate.text or '')[:2500]}")
         lines += [
             "",
-            f"Write an answer of at most {max_words} words, as a JSON array of objects "
-            'with "text" and "citations".',
+            # These narratives bundle several distinct sub-questions and are scored
+            # on how much of the expected content the answer covers, so an explicit
+            # length target matters: "at most N words" alone reliably produced
+            # ~250-word answers against a 1024-word budget.
+            f"Write a thorough answer of {int(max_words * 0.6)}-{int(max_words * 0.9)} "
+            f"words (hard maximum {max_words}), as a JSON array of objects with "
+            '"text" and "citations".',
+            "Identify every distinct sub-question the request asks and address each "
+            "one explicitly; breadth of coverage matters more than depth on any "
+            "single point. If the evidence does not cover a sub-question, say so "
+            "rather than inventing an answer.",
             f'"citations" must be a list of at most {max_citations} zero-based indices '
-            "into the evidence passages above.",
+            "into the evidence passages above, ordered strongest support first.",
             "Every sentence must be supported by at least one cited passage. Do not "
             "invent facts absent from the evidence.",
             'Respond with only the JSON array, e.g. [{"text": "...", "citations": [0, 2]}].',
@@ -126,6 +144,16 @@ class LLMGenerator(Generator):
             citations = item.get("citations", [])
             if not isinstance(citations, list):
                 citations = []
-            citations = [c for c in citations if isinstance(c, int) and 0 <= c < num_evidence]
+            # Models routinely emit "0" instead of 0; dropping those would strip a
+            # sentence of all citations and get it deleted in post-processing.
+            coerced = []
+            for c in citations:
+                if isinstance(c, bool):
+                    continue
+                if isinstance(c, int):
+                    coerced.append(c)
+                elif isinstance(c, str) and c.strip().lstrip("-").isdigit():
+                    coerced.append(int(c.strip()))
+            citations = [c for c in coerced if 0 <= c < num_evidence]
             parsed.append({"text": str(item["text"]), "citations": citations})
         return parsed or None

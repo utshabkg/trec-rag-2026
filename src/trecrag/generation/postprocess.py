@@ -34,7 +34,12 @@ def postprocess_rag_answer(
     for sentence in cleaned:
         word_count = len(sentence.text.split())
         if word_count > budget:
-            break
+            # Skip this one and keep going, rather than `break`. A single
+            # oversized "sentence" -- easy to produce, since split_sentences only
+            # breaks on [.!?] and an unpunctuated blob stays one unit -- would
+            # otherwise discard every valid sentence after it, and an answer that
+            # loses all its sentences also loses all its references and scores zero.
+            continue
         kept.append(sentence)
         budget -= word_count
 

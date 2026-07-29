@@ -11,9 +11,12 @@ import json
 import re
 from pathlib import Path
 
+from trecrag.logging_utils import get_logger
 from trecrag.schema import Topic
 
-_ALLOWED_METADATA_KEYS = {"team_id", "narrative_id", "narrative", "run_id", "run_desc"}
+_logger = get_logger("validate")
+
+_REQUIRED_METADATA_KEYS = {"team_id", "narrative_id", "narrative", "run_id", "run_desc"}
 _SECRET_PATTERNS = [
     re.compile(r"Bearer\s+[A-Za-z0-9\-_.]{10,}"),
     re.compile(r"sk-[A-Za-z0-9]{10,}"),
@@ -124,10 +127,9 @@ def validate_rag_jsonl(
         answer = record.get("answer", [])
 
         if isinstance(metadata, dict):
-            extra_keys = set(metadata) - _ALLOWED_METADATA_KEYS
-            if extra_keys:
-                violations.append(f"{prefix}: metadata has disallowed extra keys {sorted(extra_keys)}")
-            missing_keys = _ALLOWED_METADATA_KEYS - set(metadata)
+            # Extra metadata keys are explicitly permitted: "metadata: may also
+            # contain any additional participant-defined fields" (rag-task.md).
+            missing_keys = _REQUIRED_METADATA_KEYS - set(metadata)
             if missing_keys:
                 violations.append(f"{prefix}: metadata missing keys {sorted(missing_keys)}")
 
@@ -152,6 +154,14 @@ def validate_rag_jsonl(
         if not isinstance(answer, list):
             violations.append(f"{prefix}: 'answer' must be a list")
             answer = []
+
+        # An empty answer is syntactically valid but scores zero, and every other
+        # check below passes vacuously on one -- so without this the validator
+        # cheerfully reports "All checks passed" on a dead narrative.
+        if isinstance(answer, list) and not answer:
+            violations.append(f"{prefix}: 'answer' is empty (this narrative would score zero)")
+        if isinstance(references, list) and not references:
+            violations.append(f"{prefix}: 'references' is empty (nothing is cited)")
 
         cited_reference_indices: set[int] = set()
         total_words = 0
@@ -181,11 +191,13 @@ def validate_rag_jsonl(
         if total_words > max_words:
             violations.append(f"{prefix}: answer is {total_words} words, exceeds max {max_words}")
 
+        # Deliberately not a violation: rag-task.md says "Do not reject or penalize
+        # a RAG object because `references` contains uncited document IDs."
         uncited = set(range(len(references))) - cited_reference_indices
         if uncited:
-            violations.append(
-                f"{prefix}: {len(uncited)} reference(s) not cited by any answer sentence "
-                f"(indices {sorted(uncited)[:10]})"
+            _logger.info(
+                "%s: %d reference(s) uncited (allowed by the spec, not a violation)",
+                prefix, len(uncited),
             )
 
     if topics_by_id is not None:

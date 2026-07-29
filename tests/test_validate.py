@@ -70,13 +70,16 @@ class TestValidateRagJsonl(unittest.TestCase):
             violations = validate_rag_jsonl(path)
         self.assertTrue(any("invalid JSON" in v for v in violations))
 
-    def test_detects_disallowed_metadata_keys(self):
+    def test_allows_extra_metadata_keys(self):
+        """rag-task.md: metadata "may also contain any additional
+        participant-defined fields", and validators must not reject them."""
         record = self._valid_record()
-        record["metadata"]["extra_field"] = "oops"
+        record["metadata"]["generator"] = "llama3.3:70b"
+        record["metadata"]["retrieval_depth"] = 50
         with tempfile.TemporaryDirectory() as tmp:
             path = _write(Path(tmp), "out.jsonl", json.dumps(record) + "\n")
             violations = validate_rag_jsonl(path)
-        self.assertTrue(any("disallowed extra keys" in v for v in violations))
+        self.assertEqual(violations, [])
 
     def test_detects_too_many_citations(self):
         record = self._valid_record()
@@ -95,13 +98,25 @@ class TestValidateRagJsonl(unittest.TestCase):
             violations = validate_rag_jsonl(path)
         self.assertTrue(any("citation index" in v for v in violations))
 
-    def test_detects_uncited_reference(self):
+    def test_allows_uncited_references(self):
+        """rag-task.md: "Do not reject or penalize a RAG object because
+        `references` contains uncited document IDs." """
         record = self._valid_record()
         record["references"] = ["d1", "d2", "d3"]
         with tempfile.TemporaryDirectory() as tmp:
             path = _write(Path(tmp), "out.jsonl", json.dumps(record) + "\n")
             violations = validate_rag_jsonl(path)
-        self.assertTrue(any("not cited" in v for v in violations))
+        self.assertEqual(violations, [])
+
+    def test_detects_empty_answer(self):
+        """Syntactically valid, scores zero, and passes every other check."""
+        record = self._valid_record()
+        record["answer"] = []
+        record["references"] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(Path(tmp), "out.jsonl", json.dumps(record) + "\n")
+            violations = validate_rag_jsonl(path)
+        self.assertTrue(any("would score zero" in v for v in violations))
 
     def test_detects_word_count_over_limit(self):
         record = self._valid_record()
