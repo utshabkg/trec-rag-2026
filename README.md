@@ -68,10 +68,14 @@ tests/                         unittest suite (network-free; fakes/hashing backe
 ## Setup
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .                 # core deps: requests, PyYAML, numpy
-pip install -e ".[neural,ltr,llm]"   # optional: real model backends
+conda create -y -n trec-rag-2026 python=3.11 && conda activate trec-rag-2026
+pip install -e ".[neural,ltr]"
+# torch must match the local driver; on CUDA 12.9 boxes:
+pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu128
 ```
+
+`pip install -e .` alone (requests + PyYAML + numpy) is enough to run the
+zero-setup fallback config.
 
 ### Secrets
 
@@ -89,14 +93,59 @@ LLM_MODEL=...
 Request a Pyserini API token by emailing `get-pyserini@googlegroups.com`.
 `scripts/*.py` load `.env.local` automatically via `trecrag.config.load_dotenv_local`.
 
+## Two configs
+
+| Config | Purpose |
+|---|---|
+| `configs/pipeline.yaml` | Zero-setup default. Every neural stage runs its dependency-free fallback, so it executes anywhere with no GPU, models, or keys. Useful for plumbing tests — **not** for a real submission: listwise reranking is a literal no-op and answers are extracted sentences. |
+| `configs/pipeline.gpu.yaml` | The submission config. Real e5 biencoder + cross-encoder on GPU, Ollama-backed listwise reranking and answer generation, and on-disk caching of Pyserini responses. |
+
 ## Running the pipeline
 
 ```bash
 python scripts/run_pipeline.py \
   --topics trec_rag_2026_test_query_set.tsv \
-  --team-id my-team --run-id my-rag-run \
+  --config configs/pipeline.gpu.yaml \
+  --team-id iris-mst --run-id bruteforce-cascade \
   --out-dir output/
 ```
+
+Run from the repo root — `.env.local` is resolved relative to the working
+directory. Use `--workers 1` with GPU backends: each neural stage holds one
+model instance and concurrent forward passes across threads are not safe.
+
+For the full 119 topics use a detached session (the run takes roughly 1.5–2
+hours, dominated by listwise reranking):
+
+```bash
+byobu new-session -d -s trecrag 'bash -lc "
+  source ~/anaconda3/etc/profile.d/conda.sh && conda activate trec-rag-2026 && \
+  cd /media/12TB/shared/shared_projects/trec-rag-2026 && \
+  python scripts/run_pipeline.py \
+    --topics trec_rag_2026_test_query_set.tsv \
+    --config configs/pipeline.gpu.yaml \
+    --team-id iris-mst --run-id bruteforce-cascade \
+    --run-desc \"BM25+e5 biencoder RRF -> LTR -> cross-encoder -> LLM listwise -> LLM generator\" \
+    --out-dir output/ --workers 1"'
+byobu attach -t trecrag        # detach with F6
+```
+
+### Resuming
+
+The run is resumable at two independent layers, so an interruption costs
+minutes rather than the whole run:
+
+- **Per-topic checkpoints** in `<out-dir>/checkpoints/` (one atomic JSON per
+  topic). Re-running the exact same command skips every finished topic and
+  reassembles the submission files from the checkpoints — no models loaded, no
+  LLM calls. A topic that raises is logged and skipped rather than aborting the
+  run, and the script exits non-zero listing any topic missing from the output.
+- **Pyserini response cache** under `pyserini.cache_dir`, keyed by
+  (index, query, hits), so retrieval never re-hits the rate-limited shared API.
+
+Pass `--no-resume` to force recomputation, or delete the relevant directory.
+Logs are teed to `<out-dir>/run_<run-id>.log` by default (`--log-file` to
+override).
 
 Writes `output/r_output_trec_rag_2026.tsv` and `output/rag_output_trec_rag_2026.jsonl`
 (filenames come from `configs/pipeline.yaml`). Use `--task retrieval|rag|both`,
@@ -146,12 +195,19 @@ network, GPU, or API keys required. If `pytest` is installed (`pip install
 
 ## Known gaps / next steps
 
-- `stages.ltr.model_path` ships unset (linear fallback); train one with
-  `scripts/train_ltr.py` against dev qrels for a real learned ranker.
-- `stages.colbert.backend` / `stages.cross_encoder.backend` /
-  `stages.llm_listwise.backend` default to the dependency-free fallbacks;
-  flip to `transformer` / `sentence_transformer` / `openai`|`anthropic`
-  once compute/API budget is available, per `configs/pipeline.yaml`.
-- Submission logistics (upload portal, exact deadline) are still unconfirmed
-  upstream — see `../plans/trec-rag-2026-participation-guide.md` §6–7 before
-  the real submission.
+- `stages.ltr.model_path` ships unset (linear fallback) in both configs; train
+  one with `scripts/train_ltr.py` against the RAG25 dev UMBRELA qrels for a real
+  learned ranker.
+- `stages.colbert.backend` stays on the lexical fallback even in the GPU config.
+  No ColBERT checkpoint is cached locally, and loading `colbert-ir/colbertv2.0`
+  through `AutoModel` would skip its projection head — i.e. score raw BERT
+  hidden states and call it ColBERT. The stage only prunes 200 -> 100 ahead of
+  the real cross-encoder, so the fallback is the honest choice until a proper
+  late-interaction backend is wired.
+- **Retrieval depth is effectively 20, not `retrieval_output.depth`.** The
+  cascade ends at `stages.llm_listwise.top_k`, so the `R` run gets whatever that
+  is; `depth: 100` only ever truncates. The track wants a variable per-narrative
+  `k` of "all and only" useful documents, so decide that number deliberately
+  rather than inheriting it from the last rerank stage.
+- Submission logistics (upload portal) are still unconfirmed upstream; the
+  deadline is Aug 8 2026 per the track guidelines skill.

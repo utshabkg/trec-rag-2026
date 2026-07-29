@@ -1,0 +1,108 @@
+# TREC RAG 2026 pipeline configuration — real backends on local GPUs + Ollama.
+#
+# `configs/pipeline.yaml` stays as the dependency-free default that runs
+# anywhere. This file is the submission config: every stage that has a real
+# backend uses it. Run with `--config configs/pipeline.gpu.yaml`.
+#
+# Requires `.env.local` with PYSERINI_API_TOKEN, and Ollama serving on
+# localhost:11434 (its OpenAI-compatible route is /v1).
+
+pyserini:
+  base_url: "http://api.castorini.uwaterloo.ca"
+  index: "climbmix-400b"
+  token_env: "PYSERINI_API_TOKEN"
+  timeout_seconds: 60
+  max_retries: 6
+  # The API is rate-limited. Retries honour Retry-After and otherwise back off
+  # 2s, 4s, 8s, ... so a 429 burst waits rather than hammering.
+  backoff_factor: 2.0
+  # Search responses are cached by (index, query, hits) so a resumed or repeated
+  # run never re-hits shared track infrastructure. ~400MB for 119 topics x 1000 hits.
+  cache_dir: "/media/12TB/shared/datasets/trec/trec-rag-2026/pyserini_cache"
+
+stages:
+  bm25:
+    hits: 1000
+
+  biencoder:
+    enabled: true
+    backend: sentence_transformer
+    model_name: "intfloat/e5-base-v2"
+    # E5 is trained with these markers; omitting them measurably costs accuracy.
+    query_prefix: "query: "
+    passage_prefix: "passage: "
+    device: "cuda"
+    batch_size: 128
+    dims: 768
+    pool_size: 1000
+
+  hybrid:
+    rrf_k: 60
+    top_k: 500
+
+  ltr:
+    enabled: true
+    model_path: null            # no dev qrels trained yet -> linear fallback
+    feature_names: ["bm25_score", "bm25_rank", "bien_score", "bien_rank", "rrf_score"]
+    weights:
+      bm25_score: 0.25
+      bien_score: 0.25
+      rrf_score: 0.5
+    top_k: 500                  # reorder the whole RRF pool; don't discard yet
+
+  colbert:
+    # DISABLED deliberately. There is no real ColBERT backend available here:
+    # no checkpoint is cached, and loading colbert-ir/colbertv2.0 through
+    # AutoModel would skip its projection head and score raw BERT hidden states
+    # while calling it ColBERT. Its only remaining function would be to prune
+    # the pool with lexical token overlap *before* the strongest scorer sees it.
+    # Batched, the cross-encoder handles 500 candidates in 0.24s, so that
+    # pruning buys no time and can only lose recall. `top_k` is kept at the pool
+    # size so the disabled stage truncates nothing.
+    enabled: false
+    backend: hashing
+    model_name: null
+    device: "cuda"
+    batch_size: 32
+    max_query_tokens: 32
+    max_doc_tokens: 180
+    top_k: 500
+
+  cross_encoder:
+    enabled: true
+    backend: sentence_transformer
+    model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    device: "cuda"
+    batch_size: 64
+    top_k: 50                   # the set handed to listwise reranking + the R run
+
+  llm_listwise:
+    enabled: true
+    backend: openai             # Ollama's OpenAI-compatible endpoint
+    model_env: "LLM_LISTWISE_MODEL"
+    window_size: 20
+    step: 10
+    max_passage_chars: 300
+    # Reorders all 50 and returns all 50: truncation here would silently cap the
+    # R run. Same number of sliding windows either way, so this costs nothing.
+    top_k: 50
+
+retrieval_output:
+  filename: "r_output_trec_rag_2026.tsv"
+  # The R task wants a per-narrative k of "all and only" useful documents, so
+  # this is the cross-encoder survivor set rather than a padded round number.
+  depth: 50
+
+generation:
+  backend: llm
+  llm_backend: openai
+  filename: "rag_output_trec_rag_2026.jsonl"
+  evidence_k: 10
+  max_words: 1024
+  max_citations_per_sentence: 3
+
+llm:
+  base_url_env: "LLM_BASE_URL"
+  api_key_env: "LLM_API_KEY"
+  model_env: "LLM_MODEL"
+  timeout_seconds: 300
