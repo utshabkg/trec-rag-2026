@@ -14,7 +14,10 @@ class BM25Retriever(Retriever):
         self.client = client
 
     def retrieve(self, topic: Topic, k: int) -> list[Candidate]:
-        hits = self.client.search(topic.text, hits=k)
+        # Adaptive: a handful of ClimbMix documents kill the API's response
+        # stream, deterministically, for any depth that includes them. Dropping
+        # to a shallower pool keeps the narrative in the submission.
+        hits, actual_depth = self.client.search_adaptive(topic.text, hits=k)
         candidates = []
         for hit in hits:
             candidates.append(
@@ -23,7 +26,14 @@ class BM25Retriever(Retriever):
                     score=hit.score,
                     rank=hit.rank,
                     text=hit.text,
-                    features={"bm25_score": hit.score, "bm25_rank": float(hit.rank)},
+                    features={
+                        "bm25_score": hit.score,
+                        "bm25_rank": float(hit.rank),
+                        # Persisted into the checkpoint, so a narrative that had to
+                        # be retrieved shallowly is auditable after the fact rather
+                        # than indistinguishable from a full-depth one.
+                        "bm25_depth": float(actual_depth),
+                    },
                 )
             )
         return candidates

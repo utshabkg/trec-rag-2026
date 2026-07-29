@@ -101,5 +101,49 @@ class TestTransportRetries(unittest.TestCase):
         self.assertEqual(session.calls, 1)
 
 
+class _DepthSession:
+    """Fails for any request deeper than `max_ok`, mimicking the real API's
+    behaviour when a result set contains a document that kills the response."""
+
+    def __init__(self, max_ok):
+        self.max_ok = max_ok
+        self.depths = []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        depth = int(params["hits"])
+        self.depths.append(depth)
+        if depth > self.max_ok:
+            raise requests.exceptions.ChunkedEncodingError("Connection broken")
+        return _Response(_OK)
+
+
+class TestAdaptiveDepth(unittest.TestCase):
+    def test_full_depth_success_does_not_walk_down(self):
+        session = _DepthSession(max_ok=1000)
+        candidates, depth = _client(session).search_adaptive("q", hits=1000)
+        self.assertEqual(depth, 1000)
+        self.assertEqual(len(candidates), 1)
+
+    def test_walks_down_to_a_workable_depth(self):
+        """rag2026-72's real behaviour: fine at 500, dead at 800+."""
+        session = _DepthSession(max_ok=500)
+        _, depth = _client(session, max_retries=1).search_adaptive("q", hits=1000)
+        self.assertEqual(depth, 500)
+
+    def test_reaches_the_floor_depth(self):
+        """Regression: plain halving steps 15 -> 7, straight past a floor of 10,
+        so the one depth that works for rag2026-70 was never tried."""
+        session = _DepthSession(max_ok=10)
+        _, depth = _client(session, max_retries=1).search_adaptive("q", hits=1000, min_hits=10)
+        self.assertEqual(depth, 10)
+        self.assertIn(10, session.depths)
+
+    def test_raises_only_when_every_depth_fails(self):
+        session = _DepthSession(max_ok=0)
+        with self.assertRaises(PyseriniRequestError):
+            _client(session, max_retries=1).search_adaptive("q", hits=1000, min_hits=10)
+        self.assertIn(10, session.depths)
+
+
 if __name__ == "__main__":
     unittest.main()

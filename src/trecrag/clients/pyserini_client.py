@@ -96,15 +96,18 @@ class PyseriniClient:
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def _get_json(self, url: str, params: dict[str, Any] | None = None) -> Any:
+    def _get_json(
+        self, url: str, params: dict[str, Any] | None = None, max_attempts: int | None = None
+    ) -> Any:
         """GET and decode JSON, retrying transport-level failures with backoff.
 
         Reading the body is where large ClimbMix responses fail, and that happens
         after the status line has already been accepted -- so this sits outside
         the adapter's status-code retry rather than duplicating it.
         """
+        attempts = self.max_retries + 1 if max_attempts is None else max(1, max_attempts)
         last_error: Exception | None = None
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(attempts):
             try:
                 response = self.session.get(
                     url, params=params, headers=self._headers(), timeout=self.timeout_seconds
@@ -115,7 +118,7 @@ class PyseriniClient:
                 raise  # a bad token will not fix itself; fail fast
             except _TRANSPORT_ERRORS as exc:
                 last_error = exc
-                if attempt == self.max_retries:
+                if attempt == attempts - 1:
                     break
                 delay = self.backoff_factor * (2**attempt)
                 logger.warning(
@@ -164,7 +167,63 @@ class PyseriniClient:
         response = self.session.get(f"{self.base_url}/", timeout=self.timeout_seconds)
         return response.status_code == 200
 
-    def search(self, query: str, hits: int = 10) -> list[SearchCandidate]:
+    def search_adaptive(
+        self, query: str, hits: int, min_hits: int = 10
+    ) -> tuple[list[SearchCandidate], int]:
+        """Search at `hits`, falling back to shallower depths on a hard failure.
+
+        Some ClimbMix documents crash the API's response stream: the request dies
+        mid-body with a connection reset, deterministically, for any depth deep
+        enough to include the offending document. Measured on the real service:
+        rag2026-70 succeeds at hits<=10 and fails at >=25; rag2026-72 succeeds at
+        <=500 and fails at >=800. `parse=false` does not avoid it.
+
+        Retrying cannot fix a deterministic failure, so instead we walk the depth
+        down until the bad document falls outside the requested window. A
+        narrative retrieved shallowly is far better than one missing from the
+        submission entirely. Returns the candidates and the depth actually used,
+        so the caller can record what happened rather than silently degrade.
+        """
+        try:
+            return self.search(query, hits=hits), hits
+        except PyseriniRequestError:
+            logger.warning(
+                "search failed at hits=%d after retries; walking depth down "
+                "(a document in this result set breaks the API's response stream)",
+                hits,
+            )
+
+        # Halve repeatedly, but always finish on min_hits itself: plain halving
+        # steps straight past the floor (1000 -> ... -> 15 -> 7), and 7 < floor
+        # ends the walk without ever trying 10 -- which is exactly the depth that
+        # works for rag2026-70.
+        ladder: list[int] = []
+        depth = hits // 2
+        while depth > min_hits:
+            ladder.append(depth)
+            depth //= 2
+        ladder.append(min_hits)
+
+        for depth in ladder:
+            try:
+                # One attempt per depth: failures here are deterministic, so the
+                # patient backoff already spent at full depth would only stall.
+                candidates = self.search(query, hits=depth, max_attempts=1)
+                logger.warning(
+                    "search recovered at hits=%d (requested %d); this narrative is "
+                    "retrieved shallower than the rest of the run",
+                    depth, hits,
+                )
+                return candidates, depth
+            except (PyseriniRequestError, *_TRANSPORT_ERRORS):
+                continue
+        raise PyseriniRequestError(
+            f"search failed at every depth from {hits} down to {min_hits}"
+        )
+
+    def search(
+        self, query: str, hits: int = 10, max_attempts: int | None = None
+    ) -> list[SearchCandidate]:
         cache_path = self._cache_path("search", f"{query}|{hits}")
         payload: Any = None
         if cache_path and cache_path.is_file():
@@ -177,6 +236,7 @@ class PyseriniClient:
             payload = self._get_json(
                 f"{self.base_url}/v1/{self.index}/search",
                 params={"query": query, "hits": hits},
+                max_attempts=max_attempts,
             )
             if cache_path:
                 tmp = cache_path.with_suffix(".tmp")
