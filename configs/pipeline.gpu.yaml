@@ -17,12 +17,29 @@ pyserini:
   # 2s, 4s, 8s, ... so a 429 burst waits rather than hammering.
   backoff_factor: 2.0
   # Search responses are cached by (index, query, hits) so a resumed or repeated
-  # run never re-hits shared track infrastructure. ~400MB for 119 topics x 1000 hits.
+  # run never re-hits shared track infrastructure. MEASURED at ~63 MB per topic
+  # (ClimbMix returns whole documents), so budget ~7.5 GB for all 119.
   cache_dir: "/media/12TB/shared/datasets/trec/trec-rag-2026/pyserini_cache"
 
 stages:
   bm25:
+    # The cache key includes `hits`, so changing this invalidates every cached
+    # payload and re-issues 119 x 1000-hit searches. Pin it.
     hits: 1000
+
+  passage_selection:
+    # ClimbMix documents are whole pages/books: measured mean 66,685 chars,
+    # median 42,948, and NOT ONE of 1000 candidates was under 2000 chars. Every
+    # downstream stage truncates its input, so without this they all score and
+    # cite each document's title page. Measured over 200 real candidates: the
+    # leading window was the best window in only 10/200 docs, the median best
+    # window began at char 15,900, and selecting it raised query overlap 32%.
+    # CPU-only, ~1.7s per 1000-candidate topic.
+    enabled: true
+    window_chars: 2000        # ~512 tokens, matching the e5/CE input limits
+    stride_chars: 1000
+    windows_per_doc: 2        # narratives are multi-faceted; one span rarely covers them
+    min_doc_chars: 2000       # already passage-sized: leave untouched
 
   biencoder:
     enabled: true
@@ -82,7 +99,9 @@ stages:
     model_env: "LLM_LISTWISE_MODEL"
     window_size: 20
     step: 10
-    max_passage_chars: 300
+    # Raised from 300 now that passage_selection guarantees these chars are the
+    # query-relevant span rather than the document's opening boilerplate.
+    max_passage_chars: 1200
     # Reorders all 50 and returns all 50: truncation here would silently cap the
     # R run. Same number of sliding windows either way, so this costs nothing.
     top_k: 50

@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from trecrag.clients.llm_client import AnthropicClient, IdentityLLMClient, LLMClient, OpenAICompatibleClient
+from trecrag.chunking import PassageSelector
 from trecrag.clients.pyserini_client import PyseriniClient
 from trecrag.config import get_env, require_env
 from trecrag.generation.generator import ExtractiveGenerator, Generator, LLMGenerator
@@ -58,6 +59,17 @@ def build_pyserini_client(config: dict[str, Any]) -> PyseriniClient:
         max_retries=int(pyserini_config.get("max_retries", 3)),
         cache_dir=pyserini_config.get("cache_dir"),
         backoff_factor=float(pyserini_config.get("backoff_factor", 0.5)),
+    )
+
+
+def build_passage_selector(cfg: dict[str, Any]) -> PassageSelector | None:
+    if not cfg.get("enabled", False):
+        return None
+    return PassageSelector(
+        window_chars=int(cfg.get("window_chars", 2000)),
+        stride_chars=int(cfg.get("stride_chars", 1000)),
+        windows_per_doc=int(cfg.get("windows_per_doc", 2)),
+        min_doc_chars=int(cfg.get("min_doc_chars", 2000)),
     )
 
 
@@ -174,6 +186,7 @@ def build_pipeline_from_config(config: dict[str, Any]) -> RagPipeline:
         depths=depths,
         generation=generation,
         generator=build_generator(generation_cfg, llm_cfg),
+        passage_selector=build_passage_selector(stages.get("passage_selection", {})),
         biencoder=build_biencoder(stages.get("biencoder", {})),
         ltr=build_ltr(ltr_cfg),
         colbert=build_colbert(colbert_cfg),

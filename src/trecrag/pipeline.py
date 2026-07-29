@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from trecrag.chunking import PassageSelector
 from trecrag.generation.generator import Generator
 from trecrag.rerank.base import Reranker
 from trecrag.retrieval.base import Retriever
@@ -50,8 +51,10 @@ class RagPipeline:
         colbert: Reranker | None = None,
         cross_encoder: Reranker | None = None,
         llm_listwise: Reranker | None = None,
+        passage_selector: PassageSelector | None = None,
     ):
         self.bm25 = bm25
+        self.passage_selector = passage_selector
         self.biencoder = biencoder
         self.ltr = ltr
         self.colbert = colbert
@@ -63,6 +66,12 @@ class RagPipeline:
 
     def retrieve(self, topic: Topic) -> list[Candidate]:
         bm25_candidates = self.bm25.retrieve(topic, self.depths.bm25_hits)
+
+        # ClimbMix returns whole documents (median ~43k chars). Narrow each to its
+        # query-relevant span once, here, so every later stage scores and cites
+        # that span instead of independently truncating to the document's opening.
+        if self.passage_selector is not None:
+            bm25_candidates = self.passage_selector.apply(topic.text, bm25_candidates)
 
         ranked_lists = [bm25_candidates]
         if self.biencoder is not None:
