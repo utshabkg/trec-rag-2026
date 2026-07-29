@@ -8,9 +8,24 @@ new backend implementing `LLMClient`) once credentials are available.
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 
 import requests
+
+_THINK_BLOCK_RE = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning(text: str) -> str:
+    """Remove chain-of-thought blocks that reasoning models emit inline.
+
+    Both downstream parsers are positional: the listwise reranker takes every
+    integer in the response as a rank permutation, and the generator takes the
+    first bracketed span as its JSON answer. Reasoning text contains plenty of
+    both, so leaving it in silently corrupts rankings and answers rather than
+    failing loudly.
+    """
+    return _THINK_BLOCK_RE.sub("", text).strip()
 
 
 class LLMClient(ABC):
@@ -50,7 +65,7 @@ class OpenAICompatibleClient(LLMClient):
         )
         response.raise_for_status()
         payload = response.json()
-        return payload["choices"][0]["message"]["content"]
+        return strip_reasoning(payload["choices"][0]["message"]["content"] or "")
 
 
 class AnthropicClient(LLMClient):
@@ -72,4 +87,6 @@ class AnthropicClient(LLMClient):
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
-        return "".join(block.text for block in response.content if block.type == "text")
+        return strip_reasoning(
+            "".join(block.text for block in response.content if block.type == "text")
+        )

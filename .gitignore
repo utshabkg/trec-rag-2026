@@ -224,7 +224,9 @@ __marimo__/
 .env.*.local
 .curlrc.pyserini-rest
 
-# Submission artifacts and cached API responses
-output/
+# Submission artifacts and cached API responses.
+# Leading slash anchors this to the repo root so it does not also swallow
+# the src/trecrag/output/ package.
+/output/
 *.jsonl.tmp
 
