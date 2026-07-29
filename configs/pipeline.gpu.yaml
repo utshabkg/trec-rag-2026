@@ -124,4 +124,9 @@ llm:
   base_url_env: "LLM_BASE_URL"
   api_key_env: "LLM_API_KEY"
   model_env: "LLM_MODEL"
-  timeout_seconds: 300
+  # Ollama is shared: if another process has a different model resident, our
+  # request blocks behind a multi-GB model swap. Observed 578s for one topic and
+  # a 300s read timeout on another, each costing the whole topic.
+  timeout_seconds: 900
+  max_attempts: 3
+  retry_backoff_seconds: 10.0

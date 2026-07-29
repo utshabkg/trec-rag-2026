@@ -42,7 +42,12 @@ def build_llm_client(
     if backend == "openai":
         base_url = require_env(llm_config["base_url_env"], hint="LLM base URL")
         return OpenAICompatibleClient(
-            base_url=base_url, api_key=api_key, model=model, timeout_seconds=timeout_seconds
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            max_attempts=int(llm_config.get("max_attempts", 3)),
+            retry_backoff=float(llm_config.get("retry_backoff_seconds", 5.0)),
         )
     if backend == "anthropic":
         return AnthropicClient(api_key=api_key, model=model, timeout_seconds=timeout_seconds)
