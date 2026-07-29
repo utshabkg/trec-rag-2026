@@ -17,9 +17,13 @@ from trecrag.schema import Topic
 _logger = get_logger("validate")
 
 _REQUIRED_METADATA_KEYS = {"team_id", "narrative_id", "narrative", "run_id", "run_desc"}
+# Anchored on a left word boundary and lengthened to real key sizes. Without the
+# \b, "sk-[A-Za-z0-9]{10,}" fires on ordinary English -- it flagged a genuine
+# answer containing "risk-perception commons" -- and a scanner that cries wolf on
+# a valid submission is one people learn to skip.
 _SECRET_PATTERNS = [
-    re.compile(r"Bearer\s+[A-Za-z0-9\-_.]{10,}"),
-    re.compile(r"sk-[A-Za-z0-9]{10,}"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9\-_.]{20,}"),
+    re.compile(r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_\-]{20,}"),
     re.compile(r"PYSERINI_API_TOKEN\s*="),
 ]
 
