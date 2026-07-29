@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# TREC RAG secrets. The bare `.env` rule above does NOT match `.env.local`,
+# which is where the README and the pyserini-rest-api skill both say to put
+# PYSERINI_API_TOKEN / LLM_API_KEY.
+.env.local
+.env.*.local
+.curlrc.pyserini-rest
+
+# Submission artifacts and cached API responses
+output/
+*.jsonl.tmp
+
