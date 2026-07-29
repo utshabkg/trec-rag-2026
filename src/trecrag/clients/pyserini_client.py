@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,21 @@ from typing import Any
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from trecrag.logging_utils import get_logger
+
+logger = get_logger("pyserini_client")
+
+# urllib3's Retry keys off HTTP status codes, so it only covers failures that
+# produce a response. ClimbMix search payloads run to ~60 MB, and a connection
+# dropped part-way through the body raises at the read layer instead -- observed
+# once in 73 topics on a real run. Retry those explicitly.
+_TRANSPORT_ERRORS = (
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    json.JSONDecodeError,  # truncated body that still parsed as a complete response
+)
 
 
 class PyseriniAuthError(RuntimeError):
@@ -75,8 +91,42 @@ class PyseriniClient:
         self.timeout_seconds = timeout_seconds
         self.session = session or self._build_session(max_retries, backoff_factor)
         self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _get_json(self, url: str, params: dict[str, Any] | None = None) -> Any:
+        """GET and decode JSON, retrying transport-level failures with backoff.
+
+        Reading the body is where large ClimbMix responses fail, and that happens
+        after the status line has already been accepted -- so this sits outside
+        the adapter's status-code retry rather than duplicating it.
+        """
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.session.get(
+                    url, params=params, headers=self._headers(), timeout=self.timeout_seconds
+                )
+                self._raise_for_status(response)
+                return response.json()
+            except PyseriniAuthError:
+                raise  # a bad token will not fix itself; fail fast
+            except _TRANSPORT_ERRORS as exc:
+                last_error = exc
+                if attempt == self.max_retries:
+                    break
+                delay = self.backoff_factor * (2**attempt)
+                logger.warning(
+                    "transport error (%s), retrying in %.1fs [%d/%d]",
+                    type(exc).__name__, delay, attempt + 1, self.max_retries,
+                )
+                time.sleep(delay)
+        raise PyseriniRequestError(
+            f"Pyserini API request failed after {self.max_retries} retries: "
+            f"{type(last_error).__name__}: {last_error}"
+        )
 
     def _cache_path(self, kind: str, key: str) -> Path | None:
         """The API is shared infrastructure and results are deterministic, so a
@@ -124,14 +174,10 @@ class PyseriniClient:
                 payload = None
 
         if payload is None:
-            response = self.session.get(
+            payload = self._get_json(
                 f"{self.base_url}/v1/{self.index}/search",
                 params={"query": query, "hits": hits},
-                headers=self._headers(),
-                timeout=self.timeout_seconds,
             )
-            self._raise_for_status(response)
-            payload = response.json()
             if cache_path:
                 tmp = cache_path.with_suffix(".tmp")
                 tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -150,13 +196,7 @@ class PyseriniClient:
         return candidates
 
     def fetch_doc(self, docid: str) -> str | None:
-        response = self.session.get(
-            f"{self.base_url}/v1/{self.index}/doc/{docid}",
-            headers=self._headers(),
-            timeout=self.timeout_seconds,
-        )
-        self._raise_for_status(response)
-        payload = response.json()
+        payload = self._get_json(f"{self.base_url}/v1/{self.index}/doc/{docid}")
         return _extract_text(payload.get("doc"))
 
     def _raise_for_status(self, response: requests.Response) -> None:
