@@ -73,6 +73,9 @@ def build_pyserini_client(config: dict[str, Any]) -> PyseriniClient:
         max_retries=int(pyserini_config.get("max_retries", 3)),
         cache_dir=pyserini_config.get("cache_dir"),
         backoff_factor=float(pyserini_config.get("backoff_factor", 0.5)),
+        rate_limit_pause_seconds=float(
+            pyserini_config.get("rate_limit_pause_seconds", 60.0)
+        ),
     )
 
 

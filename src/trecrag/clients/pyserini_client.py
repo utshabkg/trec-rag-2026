@@ -39,6 +39,12 @@ _TRANSPORT_ERRORS = (
     requests.exceptions.ConnectionError,
     requests.exceptions.Timeout,
     json.JSONDecodeError,  # truncated body that still parsed as a complete response
+    # RetryError is what the adapter raises once urllib3's own Retry gives up --
+    # in practice, a 429 burst. The service sheds load from the highest-volume
+    # caller when latency spikes, so the right response is to wait longer, not to
+    # abort: without this the exception escaped the retry loop entirely and killed
+    # whole scripts mid-run.
+    requests.exceptions.RetryError,
 )
 
 
@@ -84,6 +90,7 @@ class PyseriniClient:
         session: requests.Session | None = None,
         cache_dir: str | Path | None = None,
         backoff_factor: float = 0.5,
+        rate_limit_pause_seconds: float = 60.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.index = index
@@ -93,6 +100,7 @@ class PyseriniClient:
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
+        self.rate_limit_pause_seconds = rate_limit_pause_seconds
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -152,11 +160,24 @@ class PyseriniClient:
                 last_error = exc
                 if attempt == attempts - 1:
                     break
-                delay = self.backoff_factor * (2**attempt)
-                logger.warning(
-                    "transport error (%s), retrying in %.1fs [%d/%d]",
-                    type(exc).__name__, delay, attempt + 1, self.max_retries,
-                )
+                # A RetryError means urllib3 already exhausted its own backoff --
+                # for this service that is load shedding, and the organizers'
+                # guidance is to pause and retry rather than back off harder in
+                # place. Waiting seconds more on top of a failed 2-4-8-16-32-64s
+                # ladder is pointless, so rate limiting gets its own, much longer
+                # pause; ordinary transport blips keep the short ladder.
+                if isinstance(exc, requests.exceptions.RetryError):
+                    delay = self.rate_limit_pause_seconds * (attempt + 1)
+                    logger.warning(
+                        "rate limited (429 burst); pausing %.0fs before retry [%d/%d]",
+                        delay, attempt + 1, attempts - 1,
+                    )
+                else:
+                    delay = self.backoff_factor * (2**attempt)
+                    logger.warning(
+                        "transport error (%s), retrying in %.1fs [%d/%d]",
+                        type(exc).__name__, delay, attempt + 1, attempts - 1,
+                    )
                 time.sleep(delay)
         raise PyseriniRequestError(
             f"Pyserini API request failed after {self.max_retries} retries: "

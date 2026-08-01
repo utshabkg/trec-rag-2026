@@ -226,6 +226,15 @@ __marimo__/
 .env.*.local
 .curlrc.pyserini-rest
 
-# Submission artifacts and cached API responses
-output/
+# Submission artifacts and cached API responses.
+# Leading slash anchors these to the repo root so they do not also swallow the
+# src/trecrag/output/ package -- an unanchored `output/` silently untracked
+# checkpoint.py, which is why run_pipeline.py could not import it on this branch.
+# The glob covers per-run directories (output_baseline/, output_decomp/, ...).
+/output/
+/output_*/
 *.jsonl.tmp
+logs/
+models/
+
+trec-rag-data/
