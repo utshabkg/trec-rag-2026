@@ -317,10 +317,39 @@ Decomposition addresses both open problems at once: it is the only lever on
 recall under a sparse-only index (§3.1), and per-sub-question generation is the
 structural fix for coverage (§5.2).
 
-- **Step 1 — built and tested** (`scripts/decompose/`, spec in
+- **Step 1 — DONE** (`scripts/decompose/`, spec in
   `plans/decompose/preprocessing_step_1.md`). vLLM offline batch, XML tags with a
   deterministic parser, one fallback retry, independent pre-write gate, flagged
   file so no query can silently vanish.
+
+  **Run:** Qwen2.5-72B-Instruct-AWQ, tensor_parallel_size=2, temperature 0.
+  Output banked at `datasets/trec/trec-rag-2026/decompositions/step1_20260801_0841/`.
+
+  | | |
+  |---|---|
+  | parsed on first attempt | **119/119** (0 fallbacks, 0 flagged) |
+  | `comp_query` preserved exactly | yes, all 119 |
+  | sub-questions per narrative | 1:16, 2:67, 3:18, 4:11, 5:6, 8:1 — mean **2.40** |
+  | narratives with no framing (empty metadata) | 16/119 |
+  | content-word recall of the original | mean **0.991**, median 1.000, min 0.823 |
+
+  Verbatim fidelity measured 67.5% exact / 15.0% near-verbatim / 17.5%
+  "materially rewritten", but inspection shows the last bucket is almost entirely
+  the prompt's own allowance — merging a sentence the asker split ("Write an
+  investment plan… Specifically, the timespan…") or fixing a dangling connective
+  so the question stands alone. The strict test required the whole normalised
+  string to appear contiguously, which any sentence join fails. Content-word
+  recall of 0.991 confirms nothing substantive is dropped; the missing tokens are
+  function words (`have`, `any`, `even`, `furthermore`).
+
+  Spot-check: `rag2026-0` reproduces the worked decomposition in Debayan's spec
+  exactly — the two framing sentences as metadata, and the "what should we
+  prioritize" and "how should we think about tradeoffs" questions as the two
+  sub-questions.
+
+  *Note for the paper:* mean 2.40 sub-questions per narrative is the direct
+  justification for per-facet generation (§5.2) — the baseline emits a
+  near-constant 9.5 sentences regardless of how many questions were asked.
 - **Step 2 — to build:** retrieve per sub-question, RRF-fuse with the base run.
 - **Step 3 — to build:** one generation pass per sub-question, assembled.
 
