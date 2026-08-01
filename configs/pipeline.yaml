@@ -1,0 +1,77 @@
+# TREC RAG 2026 pipeline configuration.
+# Every stage has a lightweight dependency-free fallback backend so the pipeline
+# runs end to end without GPUs, model downloads, or API keys. Swap `backend:`
+# values below once real models/credentials are available; nothing else changes.
+
+pyserini:
+  base_url: "http://api.castorini.uwaterloo.ca"
+  index: "climbmix-400b"
+  token_env: "PYSERINI_API_TOKEN"
+  timeout_seconds: 20
+  max_retries: 3
+
+stages:
+  bm25:
+    hits: 1000
+
+  biencoder:
+    enabled: true
+    backend: hashing            # hashing | sentence_transformer
+    model_name: "intfloat/e5-base-v2"
+    dims: 768
+    pool_size: 1000             # candidates re-scored from the BM25 pool (no separate ANN index for ClimbMix)
+
+  hybrid:
+    rrf_k: 60
+    top_k: 500
+
+  ltr:
+    enabled: true
+    model_path: null            # path to a trained LightGBM LambdaMART booster; null uses the linear fallback
+    feature_names: ["bm25_score", "bm25_rank", "bien_score", "bien_rank", "rrf_score"]
+    weights:
+      bm25_score: 0.25
+      bien_score: 0.25
+      rrf_score: 0.5
+    top_k: 200
+
+  colbert:
+    enabled: true
+    backend: hashing            # hashing | transformer
+    model_name: null            # e.g. "colbert-ir/colbertv2.0" when backend: transformer
+    max_query_tokens: 32
+    max_doc_tokens: 180
+    top_k: 100
+
+  cross_encoder:
+    enabled: true
+    backend: lexical            # lexical | sentence_transformer
+    model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    top_k: 50
+
+  llm_listwise:
+    enabled: true
+    backend: identity           # identity | openai | anthropic
+    model_env: "LLM_LISTWISE_MODEL"
+    window_size: 20
+    step: 10
+    max_passage_chars: 300
+    top_k: 20
+
+retrieval_output:
+  filename: "r_output_trec_rag_2026.tsv"
+  depth: 100
+
+generation:
+  backend: extractive           # extractive | llm
+  llm_backend: openai           # openai | anthropic (only used when backend: llm)
+  filename: "rag_output_trec_rag_2026.jsonl"
+  evidence_k: 10
+  max_words: 1024
+  max_citations_per_sentence: 3
+
+llm:
+  base_url_env: "LLM_BASE_URL"
+  api_key_env: "LLM_API_KEY"
+  model_env: "LLM_MODEL"
+  timeout_seconds: 60
