@@ -468,6 +468,63 @@ Caveat worth stating plainly: with no dev-set evaluation wired up, there is
 still no way to choose a non-zero weight on evidence. Fusion removes the
 structural blocker; it does not remove the measurement gap.
 
+### 5.6d First measured result — and why the headline number is mostly an artifact
+
+With the dev harness (§7b) the fusion weight became answerable. Sweeping
+`stages.fusion.feature_weights.qder_score` over all 22 dev topics, listwise
+disabled so this reads the retrieval cascade rather than LLM noise:
+
+| `qder_score` | nDCG@10 | nDCG@50 | recall@50 | MAP | **judged@10** | **judged@50** |
+|---|---|---|---|---|---|---|
+| 0 | 0.2956 | 0.2548 | 0.0521 | 0.0239 | 0.5682 | 0.4791 |
+| 0.25 | 0.3939 | 0.3066 | 0.0581 | 0.0294 | 0.6773 | 0.5491 |
+| 0.5 | 0.4721 | 0.3441 | 0.0620 | 0.0327 | 0.8000 | 0.6300 |
+| 1.0 | **0.5266** | 0.4017 | 0.0663 | 0.0369 | **0.9682** | 0.8036 |
+
+Read naively this says weighting an **untrained** QDER at 1.0 improves nDCG@10
+by **+78%**. That should be implausible on its face — a hashing-trick scorer
+with random bilinear weights outranking a cross-encoder distilled from ~500k MS
+MARCO queries — and the `judged@10` column says why it isn't real: it climbs
+**0.568 → 0.968** over the same sweep. At weight 1.0 essentially every top-10
+document is in the qrels pool.
+
+Unjudged documents score as non-relevant, so **anything that increases pool
+overlap increases nDCG mechanically**, whether or not the ranking got better.
+These qrels were pooled from other systems' (largely lexical) runs, and QDER's
+hashing scorer is lexical, so weighting it pulls the ranking toward documents
+the pool already contains.
+
+**Controlling for it.** Re-scoring each ranking over only its *assessed*
+documents removes the coverage effect:
+
+| | weight 0 → 1.0 | change |
+|---|---|---|
+| nDCG@10 as reported | 0.2956 → 0.5266 | **+78%** |
+| nDCG@10 judged-only | 0.4897 → 0.5334 | **+9%** |
+| judged@10 | 0.5682 → 0.9682 | +70% |
+
+**Roughly seven-eighths of the apparent gain is pooling artifact.** A paired
+bootstrap over the 22 topics (20,000 resamples):
+
+- as reported: mean Δ **+0.2311**, 95% CI [+0.1436, +0.3108], 20 topics better /
+  2 worse, p(Δ≤0) = 0.000
+- judged-only: mean Δ **+0.0436**, 95% CI [**−0.0166**, +0.1007], 14 better /
+  8 worse, p(Δ≤0) = **0.076**
+
+So the residual +9% **does not reach significance on 22 topics, and its
+confidence interval includes zero.** It is suggestive, not evidence.
+
+**Decision: keep `qder_score: 0.0`.** Shipping 1.0 on the strength of the
+headline number would have been a mistake caused by trusting a metric whose
+bias we had already documented one section earlier. The honest statement is
+that we still have no evidence QDER helps — only evidence that it makes our
+ranking look more like the pool.
+
+*Method note for the paper:* always report `judged@k` beside nDCG on these
+qrels, and prefer the judged-only comparison when ranking configurations. This
+is a textbook pool bias; it is worth writing up precisely because the naive
+number is so large and so wrong.
+
 ### 5.7 Grounding
 
 Of 1,135 checkable sentences: 309 verbatim-match a cited doc, 33 match an
@@ -523,6 +580,33 @@ Give it a **distinct `run_id`** so both runs can be submitted and told apart.
 
 ---
 
+## 7b. Dev-set evaluation
+
+`scripts/evaluate_dev.py` + `src/trecrag/eval.py` score the retrieval cascade on
+the 22 RAG25 dev topics against UMBRELA qrels: nDCG@k, recall@k, MAP, and
+`judged@k`. Rankings cache per (config-signature, topic), so an ablation pays
+the Pyserini calls once — none of the dev topics were in the response cache, and
+uncached `hits=1000` searches over them are what triggered the 429 storm.
+
+```bash
+python scripts/evaluate_dev.py --config configs/pipeline.gpu.yaml \
+    --set stages.llm_listwise.enabled=false \
+    --ablate stages.fusion.feature_weights.qder_score=0,0.25,0.5,1.0
+```
+
+**Two traps this data sets, both already sprung once (§5.6d):**
+
+1. **`judged@k` must be read first.** ~48% of what the cascade retrieves is
+   unassessed, and unjudged scores as non-relevant, so any change that raises
+   pool overlap raises nDCG for free. Prefer the judged-only comparison when
+   ranking configurations.
+2. **`--relevant-grade` defaults to 3, not 1.** At grade≥1 the median topic has
+   975 relevant documents, capping recall@50 at 5.1% — it cannot discriminate.
+   Measured ceilings: grade≥1 5.1%, ≥2 8.4%, ≥3 19.6%, ≥4 54.1% but two topics
+   then have no relevant document at all.
+
+With 22 topics, report a paired bootstrap rather than a mean difference.
+
 ## 7. Instrumentation
 
 `logs/` holds one run log and one `stages_*.jsonl` per run. Each stage records
@@ -574,9 +658,10 @@ Runtime: ~80 min with GPUs free; 512 min observed under Ollama contention.
 - [x] ~~Make QDER's score survive into the final ordering~~ — **done** (§5.6c).
       Feature-level RRF fusion after the cross-encoder. Verified: weight 0 is
       exactly inert, weight 0.5 changes 5/5 topics. QDER is now a dial.
-- [ ] **Choose a `qder_score` weight on evidence.** Ships at 0.0 because the
-      scorer is untrained and there is no dev signal to justify anything else.
-      Needs either a trained checkpoint or a dev-set metric — see below.
+- [x] ~~Choose a `qder_score` weight on evidence~~ — **measured, stays 0.0**
+      (§5.6d). The apparent +78% nDCG@10 gain is ~7/8 pool-coverage artifact;
+      controlling for it leaves +9%, whose 95% CI includes zero (p=0.076 over
+      22 topics). No evidence QDER helps.
 - [ ] Consider entity linking for ClimbMix, which would both restore the "E" and
       un-break the `doc_score` channel that LayerNorm currently erases (§5.6b).
 - [ ] Independent of QDER: `pip install pytrec-eval-terrier` in `trec-rag-2026`
@@ -601,6 +686,11 @@ Runtime: ~80 min with GPUs free; 512 min observed under Ollama contention.
 Newest first. One line per substantive change, so the paper can reconstruct what
 was true when.
 
+- **Aug 1 — Evaluation.** Built the dev harness (§7b) and got the project's first
+  measured result (§5.6d). It immediately caught a trap: weighting an untrained
+  QDER appeared to lift nDCG@10 by +78%, but judged@10 rose 0.57→0.97 over the
+  same sweep — pool bias, not ranking quality. Controlling for it leaves +9%,
+  not significant on 22 topics. Weight stays 0.0.
 - **Aug 1 — QDER branch.** Added feature-level rank fusion (§5.6c), removing the
   structural reason QDER and LTR were no-ops: earlier stages' scores now survive
   into the final ordering instead of being overwritten by the cross-encoder.
