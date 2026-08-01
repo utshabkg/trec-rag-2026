@@ -225,8 +225,11 @@ __marimo__/
 .curlrc.pyserini-rest
 
 # Submission artifacts and cached API responses.
-# Leading slash anchors this to the repo root so it does not also swallow
-# the src/trecrag/output/ package.
+# Leading slash anchors these to the repo root so they do not also swallow
+# the src/trecrag/output/ package. The glob covers per-run directories
+# (output_v2/, output_v3/, ...) -- each holds the two submission files plus 119
+# checkpoints, which are build products, not source.
 /output/
+/output_*/
 *.jsonl.tmp
 
