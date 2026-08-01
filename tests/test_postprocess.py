@@ -11,6 +11,16 @@ class TestPostprocessRagAnswer(unittest.TestCase):
         result = postprocess_rag_answer(references, sentences, max_words=1024, max_citations=2)
         self.assertEqual(result.sentences[0].citations, [0, 1])
 
+    def test_dedupes_citations_before_capping(self):
+        references = ["a", "b", "c"]
+        sentences = [AnswerSentence(text="claim.", citations=[2, 2, 0])]
+        result = postprocess_rag_answer(references, sentences, max_words=1024, max_citations=2)
+        # Deduped to [2, 0] (not capped-with-a-duplicate [2, 2]); references
+        # remap sorts old indices ascending ([0, 2] -> new 0, 1), so citation
+        # order [2, 0] becomes [1, 0].
+        self.assertEqual(result.references, ["a", "c"])
+        self.assertEqual(result.sentences[0].citations, [1, 0])
+
     def test_drops_invalid_citation_indices(self):
         references = ["a", "b"]
         sentences = [AnswerSentence(text="claim.", citations=[0, 5, -1])]
@@ -47,6 +57,21 @@ class TestPostprocessRagAnswer(unittest.TestCase):
         result = postprocess_rag_answer(references, sentences, max_words=7, max_citations=3)
         self.assertEqual(len(result.sentences), 1)
         self.assertEqual(result.references, ["a"])
+
+    def test_oversized_sentence_is_skipped_not_fatal_to_later_sentences(self):
+        """A single over-budget "sentence" must not discard everything after
+        it -- split_sentences only breaks on [.!?], so an unpunctuated blob
+        stays one giant unit, and a `break` here would silently zero out an
+        otherwise-valid answer."""
+        references = ["a", "b", "c"]
+        sentences = [
+            AnswerSentence(text="word word", citations=[0]),
+            AnswerSentence(text=" ".join(["word"] * 10), citations=[1]),
+            AnswerSentence(text="word word word", citations=[2]),
+        ]
+        result = postprocess_rag_answer(references, sentences, max_words=6, max_citations=3)
+        self.assertEqual(len(result.sentences), 2)
+        self.assertEqual(result.references, ["a", "c"])
 
     def test_empty_sentences_are_skipped(self):
         references = ["a"]

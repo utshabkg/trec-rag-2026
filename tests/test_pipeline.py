@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from tests.fakes import FakeRetriever
+from trecrag.chunking import PassageSelector
 from trecrag.clients.llm_client import IdentityLLMClient
 from trecrag.generation.generator import ExtractiveGenerator
 from trecrag.output.writers import build_rag_record, write_rag_jsonl, write_retrieval_run
@@ -101,6 +102,47 @@ class TestRagPipelineEndToEnd(unittest.TestCase):
 
         self.assertEqual(retrieval_violations, [])
         self.assertEqual(rag_violations, [])
+
+
+class TestPassageSelectorWiring(unittest.TestCase):
+    def test_retrieve_applies_passage_selection_right_after_bm25(self):
+        target = "Congestion pricing directly funds transit accountability improvements."
+        filler = "Unrelated padding text about something else entirely. " * 200
+        candidates = [Candidate(docid="buried", score=1.0, rank=1, text=f"{filler} {target}")]
+        bm25 = FakeRetriever({"t1": candidates})
+
+        pipeline = RagPipeline(
+            bm25=bm25,
+            generator=ExtractiveGenerator(),
+            passage_selector=PassageSelector(
+                window_chars=2000, stride_chars=1000, windows_per_doc=1, min_doc_chars=2000
+            ),
+            depths=StageDepths(
+                bm25_hits=5, hybrid_top_k=5, ltr_top_k=5, colbert_top_k=5, qder_top_k=5, ce_top_k=5, llm_listwise_top_k=5
+            ),
+            generation=GenerationSettings(evidence_k=1, max_words=1024, max_citations_per_sentence=3),
+        )
+        topic = Topic(topic_id="t1", text="congestion pricing transit accountability funding")
+
+        ranked = pipeline.retrieve(topic)
+
+        self.assertEqual(len(ranked), 1)
+        self.assertIn(target, ranked[0].text)
+        self.assertLess(len(ranked[0].text), len(candidates[0].text))
+
+    def test_retrieve_is_unaffected_when_no_passage_selector_is_configured(self):
+        candidates = [Candidate(docid="d1", score=1.0, rank=1, text="short doc")]
+        bm25 = FakeRetriever({"t1": candidates})
+        pipeline = RagPipeline(
+            bm25=bm25,
+            generator=ExtractiveGenerator(),
+            depths=StageDepths(
+                bm25_hits=5, hybrid_top_k=5, ltr_top_k=5, colbert_top_k=5, qder_top_k=5, ce_top_k=5, llm_listwise_top_k=5
+            ),
+            generation=GenerationSettings(evidence_k=1, max_words=1024, max_citations_per_sentence=3),
+        )
+        ranked = pipeline.retrieve(Topic(topic_id="t1", text="anything"))
+        self.assertEqual(ranked[0].text, "short doc")
 
 
 if __name__ == "__main__":

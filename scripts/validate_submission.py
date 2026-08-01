@@ -17,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from trecrag.config import load_pipeline_config
 from trecrag.data.topics import load_topics
 from trecrag.logging_utils import configure_logging, get_logger
 from trecrag.validate import validate_rag_jsonl, validate_retrieval_run
@@ -29,6 +30,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrieval", help="Path to r_output_trec_rag_2026.tsv")
     parser.add_argument("--rag", help="Path to rag_output_trec_rag_2026.jsonl")
     parser.add_argument("--topics", help="Topics TSV used to check full topic coverage")
+    parser.add_argument(
+        "--config",
+        default="configs/pipeline.yaml",
+        help="Pipeline config to validate the RAG output against (max_words, max_citations_per_sentence)",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -52,7 +58,16 @@ def main() -> None:
         violations.extend(f"[retrieval] {v}" for v in retrieval_violations)
 
     if args.rag:
-        rag_violations = validate_rag_jsonl(args.rag, topics=topics)
+        # Falling back to validate_rag_jsonl's hardcoded defaults here would
+        # silently validate against the wrong limits the moment the config's
+        # generation.max_words/max_citations_per_sentence are ever tuned.
+        generation_cfg = load_pipeline_config(args.config).get("generation", {})
+        rag_violations = validate_rag_jsonl(
+            args.rag,
+            topics=topics,
+            max_words=int(generation_cfg.get("max_words", 1024)),
+            max_citations_per_sentence=int(generation_cfg.get("max_citations_per_sentence", 3)),
+        )
         logger.info("%s: %d violation(s)", args.rag, len(rag_violations))
         violations.extend(f"[rag] {v}" for v in rag_violations)
 

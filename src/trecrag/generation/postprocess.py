@@ -10,7 +10,10 @@ either generator backend produces raw sentences:
 
 from __future__ import annotations
 
+from trecrag.logging_utils import get_logger
 from trecrag.schema import AnswerSentence, RagAnswer
+
+logger = get_logger("postprocess")
 
 
 def postprocess_rag_answer(
@@ -24,7 +27,14 @@ def postprocess_rag_answer(
         text = sentence.text.strip()
         if not text:
             continue
-        valid_citations = [i for i in sentence.citations if 0 <= i < len(references)][:max_citations]
+        # Dedupe before capping: an uncapped duplicate (e.g. [2, 2, 0] with
+        # max_citations=2) would otherwise survive the cap as [2, 2], silently
+        # wasting a citation slot on a repeat instead of a second real source.
+        deduped: list[int] = []
+        for i in sentence.citations:
+            if 0 <= i < len(references) and i not in deduped:
+                deduped.append(i)
+        valid_citations = deduped[:max_citations]
         if not valid_citations:
             continue
         cleaned.append(AnswerSentence(text=text, citations=valid_citations))
@@ -34,7 +44,12 @@ def postprocess_rag_answer(
     for sentence in cleaned:
         word_count = len(sentence.text.split())
         if word_count > budget:
-            break
+            # Skip this one and keep going, rather than `break`. A single
+            # oversized "sentence" -- easy to produce, since split_sentences only
+            # breaks on [.!?] and an unpunctuated blob stays one unit -- would
+            # otherwise discard every valid sentence after it, and an answer that
+            # loses all its sentences also loses all its references and scores zero.
+            continue
         kept.append(sentence)
         budget -= word_count
 
@@ -44,4 +59,17 @@ def postprocess_rag_answer(
     final_sentences = [
         AnswerSentence(text=s.text, citations=[remap[i] for i in s.citations]) for s in kept
     ]
+
+    if sentences and not final_sentences:
+        # Schema-valid but useless: every input sentence was dropped (no valid
+        # citation, or none fit within max_words), so this topic will submit an
+        # empty, zero-scoring answer with no other signal that anything went
+        # wrong. validate_rag_jsonl also flags this at the file level.
+        logger.warning(
+            "postprocess: %d input sentence(s) collapsed to an empty answer "
+            "(all had no valid citation, or none fit within max_words=%d)",
+            len(sentences),
+            max_words,
+        )
+
     return RagAnswer(references=new_references, sentences=final_sentences)

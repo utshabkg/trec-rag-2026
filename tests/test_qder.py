@@ -31,13 +31,25 @@ class TestHeuristicEntityProvider(unittest.TestCase):
 
     def test_deduplicates_repeated_mentions(self):
         provider = HeuristicEntityProvider(dims=16)
-        mentions = provider._mentions("Paris is beautiful. Paris is old.", max_entities=8)
-        self.assertEqual(mentions.count("Paris"), 1)
+        mentions = provider._mentions("New York is beautiful. New York is old.", max_entities=8)
+        self.assertEqual(mentions.count("New York"), 1)
 
     def test_skips_leading_stopwords(self):
         provider = HeuristicEntityProvider(dims=16)
         mentions = provider._mentions("The Eiffel Tower is tall.", max_entities=8)
         self.assertNotIn("The Eiffel Tower", mentions)
+        self.assertIn("Eiffel Tower", mentions)
+
+    def test_allows_short_acronyms(self):
+        provider = HeuristicEntityProvider(dims=16)
+        mentions = provider._mentions("The US and AI policy debate.", max_entities=8)
+        self.assertIn("US", mentions)
+        self.assertIn("AI", mentions)
+
+    def test_drops_bare_sentence_initial_capitalized_word(self):
+        provider = HeuristicEntityProvider(dims=16)
+        mentions = provider._mentions("Congestion pricing helps cities.", max_entities=8)
+        self.assertNotIn("Congestion", mentions)
 
     def test_respects_max_entities(self):
         provider = HeuristicEntityProvider(dims=16)

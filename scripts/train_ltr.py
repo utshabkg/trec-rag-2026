@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Train the LTR stage's LightGBM LambdaMART booster from a topics file and a
 standard TREC qrels file (e.g. one of the RAG25 development UMBRELA qrels in
-the sibling `trec-rag-data` repo).
+`data/dev/rag25-dev-umbrela-qrels/`).
 
 This only trains on the BM25 + biencoder + hybrid-fusion features (the
 signals available before the LTR stage runs); it does not require ColBERT,
@@ -9,8 +9,8 @@ the cross-encoder, or an LLM. Requires `pip install trecrag[ltr]`.
 
 Example:
     python scripts/train_ltr.py \\
-        --topics ../Official/trec-rag-data/trec-rag-2026/development-data/topics/rag25-topics-dev.tsv \\
-        --qrels ../Official/trec-rag-data/trec-rag-2026/development-data/rag25-dev-umbrela-qrels/rag25-climbmix-umbrela-codex-gpt5.5-medium-reasoning-v1.qrels \\
+        --topics data/dev/topics/rag25-topics-dev.tsv \\
+        --qrels data/dev/rag25-dev-umbrela-qrels/rag25-climbmix-umbrela-codex-gpt5.5-medium-reasoning-v1.qrels \\
         --output-model models/ltr_lambdamart.txt
 """
 

@@ -19,6 +19,15 @@ class PairScorer(ABC):
     @abstractmethod
     def score(self, query: str, passage: str) -> float: ...
 
+    def score_batch(self, pairs: list[tuple[str, str]]) -> list[float]:
+        """Score many (query, passage) pairs at once.
+
+        The default loops `score()`, which is what the dependency-free fallback
+        wants. Model-backed scorers override this so a whole candidate list is
+        one padded GPU forward pass instead of one pass per candidate.
+        """
+        return [self.score(query, passage) for query, passage in pairs]
+
 
 class LexicalOverlapScorer(PairScorer):
     def score(self, query: str, passage: str) -> float:
@@ -31,7 +40,13 @@ class LexicalOverlapScorer(PairScorer):
 
 
 class SentenceTransformersCrossEncoderScorer(PairScorer):
-    def __init__(self, model_name: str):
+    def __init__(
+        self,
+        model_name: str,
+        device: str | None = None,
+        batch_size: int = 64,
+        max_passage_chars: int = 2000,
+    ):
         try:
             from sentence_transformers import CrossEncoder
         except ImportError as exc:
@@ -39,10 +54,19 @@ class SentenceTransformersCrossEncoderScorer(PairScorer):
                 "SentenceTransformersCrossEncoderScorer requires 'sentence-transformers': "
                 "pip install trecrag[neural]"
             ) from exc
-        self._model = CrossEncoder(model_name)
+        self._model = CrossEncoder(model_name, device=device)
+        self.batch_size = batch_size
+        self.max_passage_chars = max_passage_chars
 
     def score(self, query: str, passage: str) -> float:
-        return float(self._model.predict([(query, passage)])[0])
+        return self.score_batch([(query, passage)])[0]
+
+    def score_batch(self, pairs: list[tuple[str, str]]) -> list[float]:
+        if not pairs:
+            return []
+        truncated = [(q, p[: self.max_passage_chars]) for q, p in pairs]
+        scores = self._model.predict(truncated, batch_size=self.batch_size, show_progress_bar=False)
+        return [float(s) for s in scores]
 
 
 class CrossEncoderReranker(Reranker):
@@ -54,8 +78,11 @@ class CrossEncoderReranker(Reranker):
     def rerank(self, topic: Topic, candidates: list[Candidate], k: int) -> list[Candidate]:
         if not candidates:
             return []
-        scores = [
-            self.scorer.score(topic.text, candidate.text) if candidate.text else float("-inf")
-            for candidate in candidates
-        ]
+        scorable = [i for i, c in enumerate(candidates) if c.text]
+        batch_scores = self.scorer.score_batch(
+            [(topic.text, candidates[i].text) for i in scorable]
+        )
+        scores = [float("-inf")] * len(candidates)
+        for i, score in zip(scorable, batch_scores):
+            scores[i] = score
         return _resorted(candidates, scores, "ce_score", k)

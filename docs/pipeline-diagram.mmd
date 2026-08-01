@@ -1,0 +1,56 @@
+flowchart TD
+    Q(["Query"])
+
+    subgraph RET["Retrieval"]
+        direction TB
+        A["Keyword Search\n1,000 candidates"]
+        B["Semantic Re-scoring\n1,000 candidates"]
+        C["Combine Rankings\n500 candidates"]
+        A --> B --> C
+    end
+
+    subgraph RRK["Reranking Cascade"]
+        direction TB
+        D["Learned Ranking\n200 candidates"]
+        E["Fine-Grained Matching\n100 candidates"]
+        F["Query &amp; Entity Focus\n80 candidates"]
+        G["Joint Scoring\n50 candidates"]
+        H["Final Reordering\n20 candidates"]
+        D --> E --> F --> G --> H
+    end
+
+    subgraph GEN["Generation &amp; Output"]
+        direction TB
+        I["Evidence Selection\n10 passages"]
+        J["Answer Writing"]
+        K["Rule Enforcement"]
+        L["Ranked List"]
+        M["Cited Answer"]
+        N["Validation"]
+        I --> J --> K
+        K --> L
+        K --> M
+        L --> N
+        M --> N
+    end
+
+    Z(["Answer Delivered"])
+
+    Q --> RET
+    RET --> RRK
+    RRK --> GEN
+    GEN --> Z
+
+    classDef retrieval fill:#eaf2f7,stroke:#3f7ea6,color:#1c2130;
+    classDef rerank fill:#efeaf6,stroke:#7860a8,color:#1c2130;
+    classDef gen fill:#faf1e3,stroke:#c9852f,color:#1c2130;
+    classDef endpoint fill:#c9852f,stroke:#c9852f,color:#ffffff;
+
+    class A,B,C retrieval
+    class D,E,F,G,H rerank
+    class I,J,K,L,M,N gen
+    class Q,Z endpoint
+
+    style RET fill:none,stroke:#3f7ea6,stroke-width:2px
+    style RRK fill:none,stroke:#7860a8,stroke-width:2px
+    style GEN fill:none,stroke:#c9852f,stroke-width:2px

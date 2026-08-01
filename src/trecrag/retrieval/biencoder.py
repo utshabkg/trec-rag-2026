@@ -23,6 +23,12 @@ class Encoder(ABC):
     @abstractmethod
     def encode(self, texts: list[str]) -> np.ndarray: ...
 
+    def encode_queries(self, texts: list[str]) -> np.ndarray:
+        return self.encode(texts)
+
+    def encode_passages(self, texts: list[str]) -> np.ndarray:
+        return self.encode(texts)
+
 
 class HashingEncoder(Encoder):
     """Deterministic bag-of-words hashing-trick encoder. No model download,
@@ -46,9 +52,22 @@ class HashingEncoder(Encoder):
 
 
 class SentenceTransformerEncoder(Encoder):
-    """Real dense encoder backend (lazy-imported optional dependency)."""
+    """Real dense encoder backend (lazy-imported optional dependency).
 
-    def __init__(self, model_name: str):
+    `query_prefix`/`passage_prefix` exist because the E5 family is trained with
+    explicit "query: " / "passage: " markers and loses accuracy without them;
+    they default to empty so prefix-free checkpoints are unaffected.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        device: str | None = None,
+        batch_size: int = 128,
+        query_prefix: str = "",
+        passage_prefix: str = "",
+        max_passage_chars: int = 2000,
+    ):
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:
@@ -56,11 +75,31 @@ class SentenceTransformerEncoder(Encoder):
                 "SentenceTransformerEncoder requires 'sentence-transformers': "
                 "pip install trecrag[neural]"
             ) from exc
-        self._model = SentenceTransformer(model_name)
+        self._model = SentenceTransformer(model_name, device=device)
+        self.batch_size = batch_size
+        self.query_prefix = query_prefix
+        self.passage_prefix = passage_prefix
+        self.max_passage_chars = max_passage_chars
 
     def encode(self, texts: list[str]) -> np.ndarray:
-        embeddings = self._model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+        if not texts:
+            return np.zeros((0, self._model.get_sentence_embedding_dimension()), dtype=np.float32)
+        embeddings = self._model.encode(
+            texts,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            batch_size=self.batch_size,
+            show_progress_bar=False,
+        )
         return np.asarray(embeddings, dtype=np.float32)
+
+    def encode_queries(self, texts: list[str]) -> np.ndarray:
+        return self.encode([f"{self.query_prefix}{t}" for t in texts])
+
+    def encode_passages(self, texts: list[str]) -> np.ndarray:
+        return self.encode(
+            [f"{self.passage_prefix}{t[: self.max_passage_chars]}" for t in texts]
+        )
 
 
 class BiencoderRetriever(Retriever):
@@ -91,8 +130,8 @@ class BiencoderRetriever(Retriever):
         if not pool:
             return []
 
-        query_vec = self.encoder.encode([topic.text])[0]
-        doc_vecs = self.encoder.encode([c.text for c in pool])
+        query_vec = self.encoder.encode_queries([topic.text])[0]
+        doc_vecs = self.encoder.encode_passages([c.text for c in pool])
         scores = doc_vecs @ query_vec
 
         order = np.argsort(-scores)[:k]

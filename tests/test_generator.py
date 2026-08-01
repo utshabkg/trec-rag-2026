@@ -78,6 +78,42 @@ class TestLLMGenerator(unittest.TestCase):
         self.assertEqual(answer.references, [])
         self.assertEqual(answer.sentences, [])
 
+    def test_bool_citations_are_rejected_not_treated_as_ints(self):
+        response = '[{"text": "A claim.", "citations": [true, 2]}]'
+        parsed = LLMGenerator._parse_response(response, num_evidence=3)
+        self.assertEqual(parsed[0]["citations"], [2])
+
+    def test_coerces_digit_strings_to_int_citations(self):
+        """Models routinely emit "0" instead of 0; dropping those would strip
+        a sentence of all citations and get it deleted in post-processing."""
+        response = '[{"text": "A claim.", "citations": ["0", "-1", "abc"]}]'
+        parsed = LLMGenerator._parse_response(response, num_evidence=3)
+        self.assertEqual(parsed[0]["citations"], [0])
+
+    def test_falls_back_to_extractive_when_postprocessing_empties_every_citation(self):
+        """Well-formed JSON whose citations are all out of range parses fine but
+        leaves zero sentences after post-processing -- that must still trigger
+        the extractive fallback, not a schema-valid empty answer."""
+        topic = Topic(topic_id="t1", text="funding evidence")
+        evidence = [Candidate(docid="d0", score=1.0, rank=1, text="funding evidence sentence here.")]
+        response = '[{"text": "A claim.", "citations": [99]}]'
+        generator = LLMGenerator(_JsonLLMClient(response))
+        answer = generator.generate(topic, evidence, max_words=1024, max_citations=3)
+        self.assertEqual(answer.references, ["d0"])
+        self.assertTrue(len(answer.sentences) >= 1)
+
+    def test_parses_json_array_with_trailing_bracketed_text(self):
+        topic = Topic(topic_id="t1", text="q")
+        evidence = [
+            Candidate(docid="d0", score=1.0, rank=1, text="evidence zero"),
+            Candidate(docid="d1", score=1.0, rank=2, text="evidence one"),
+        ]
+        response = '[{"text": "A grounded claim.", "citations": [0]}]\n\nSources: [0], [2]'
+        generator = LLMGenerator(_JsonLLMClient(response))
+        answer = generator.generate(topic, evidence, max_words=1024, max_citations=3)
+        self.assertEqual(answer.references, ["d0"])
+        self.assertEqual(answer.sentences[0].text, "A grounded claim.")
+
 
 if __name__ == "__main__":
     unittest.main()

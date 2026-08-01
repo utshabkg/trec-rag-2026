@@ -44,6 +44,28 @@ class TestValidateRetrievalRun(unittest.TestCase):
             violations = validate_retrieval_run(path, expected_topic_ids={"1", "2"})
         self.assertTrue(any("missing output" in v for v in violations))
 
+    def test_flags_topic_with_doc_count_far_below_median(self):
+        lines = []
+        for i in range(1, 11):
+            lines.append(f"1 Q0 doc-{i} {i} {11 - i}.0 run")
+        lines.append("2 Q0 only-doc 1 1.0 run")  # 1 doc vs. topic 1's 10 -> far below median
+        content = "\n".join(lines) + "\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(Path(tmp), "run.tsv", content)
+            violations = validate_retrieval_run(path)
+        self.assertTrue(any("topic 2" in v and "well below the median" in v for v in violations))
+
+    def test_does_not_flag_naturally_variable_doc_counts(self):
+        lines = []
+        for topic_id, count in (("1", 45), ("2", 60), ("3", 50)):
+            for i in range(1, count + 1):
+                lines.append(f"{topic_id} Q0 doc-{i} {i} {count + 1 - i}.0 run")
+        content = "\n".join(lines) + "\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(Path(tmp), "run.tsv", content)
+            violations = validate_retrieval_run(path)
+        self.assertEqual(violations, [])
+
 
 class TestValidateRagJsonl(unittest.TestCase):
     def _valid_record(self):
@@ -70,13 +92,16 @@ class TestValidateRagJsonl(unittest.TestCase):
             violations = validate_rag_jsonl(path)
         self.assertTrue(any("invalid JSON" in v for v in violations))
 
-    def test_detects_disallowed_metadata_keys(self):
+    def test_allows_extra_metadata_keys(self):
+        """rag-task.md: metadata "may also contain any additional
+        participant-defined fields", and validators must not reject them."""
         record = self._valid_record()
-        record["metadata"]["extra_field"] = "oops"
+        record["metadata"]["generator"] = "llama3.3:70b"
+        record["metadata"]["retrieval_depth"] = 50
         with tempfile.TemporaryDirectory() as tmp:
             path = _write(Path(tmp), "out.jsonl", json.dumps(record) + "\n")
             violations = validate_rag_jsonl(path)
-        self.assertTrue(any("disallowed extra keys" in v for v in violations))
+        self.assertEqual(violations, [])
 
     def test_detects_too_many_citations(self):
         record = self._valid_record()
@@ -95,13 +120,15 @@ class TestValidateRagJsonl(unittest.TestCase):
             violations = validate_rag_jsonl(path)
         self.assertTrue(any("citation index" in v for v in violations))
 
-    def test_detects_uncited_reference(self):
+    def test_allows_uncited_references(self):
+        """rag-task.md: "Do not reject or penalize a RAG object because
+        `references` contains uncited document IDs." """
         record = self._valid_record()
         record["references"] = ["d1", "d2", "d3"]
         with tempfile.TemporaryDirectory() as tmp:
             path = _write(Path(tmp), "out.jsonl", json.dumps(record) + "\n")
             violations = validate_rag_jsonl(path)
-        self.assertTrue(any("not cited" in v for v in violations))
+        self.assertEqual(violations, [])
 
     def test_detects_word_count_over_limit(self):
         record = self._valid_record()
@@ -120,6 +147,16 @@ class TestValidateRagJsonl(unittest.TestCase):
             path = _write(Path(tmp), "out.jsonl", json.dumps(record) + "\n")
             violations = validate_rag_jsonl(path, topics=topics)
         self.assertTrue(any("does not match" in v for v in violations))
+
+    def test_detects_empty_answer(self):
+        """Syntactically valid, scores zero, and passes every other check."""
+        record = self._valid_record()
+        record["answer"] = []
+        record["references"] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(Path(tmp), "out.jsonl", json.dumps(record) + "\n")
+            violations = validate_rag_jsonl(path)
+        self.assertTrue(any("would score zero" in v for v in violations))
 
     def test_detects_duplicate_narrative_id(self):
         record = self._valid_record()

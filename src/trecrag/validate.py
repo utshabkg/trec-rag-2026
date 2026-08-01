@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import json
 import re
+import statistics
 from pathlib import Path
 
+from trecrag.logging_utils import get_logger
 from trecrag.schema import Topic
 
-_ALLOWED_METADATA_KEYS = {"team_id", "narrative_id", "narrative", "run_id", "run_desc"}
+_logger = get_logger("validate")
+
+_REQUIRED_METADATA_KEYS = {"team_id", "narrative_id", "narrative", "run_id", "run_desc"}
 _SECRET_PATTERNS = [
     re.compile(r"Bearer\s+[A-Za-z0-9\-_.]{10,}"),
     re.compile(r"sk-[A-Za-z0-9]{10,}"),
@@ -32,6 +36,7 @@ def _scan_for_secrets(raw_text: str) -> list[str]:
 def validate_retrieval_run(
     path: str | Path,
     expected_topic_ids: set[str] | None = None,
+    min_doc_ratio: float = 0.2,
 ) -> list[str]:
     violations: list[str] = []
     raw_text = Path(path).read_text(encoding="utf-8")
@@ -40,6 +45,7 @@ def validate_retrieval_run(
     seen_topic_ids: set[str] = set()
     last_rank: dict[str, int] = {}
     last_score: dict[str, float] = {}
+    doc_counts: dict[str, int] = {}
 
     for line_no, line in enumerate(raw_text.splitlines(), start=1):
         if not line.strip():
@@ -49,6 +55,7 @@ def validate_retrieval_run(
             violations.append(f"line {line_no}: expected 6 whitespace-separated columns, got {len(fields)}")
             continue
         topic_id, q0, docid, rank_str, score_str, _run_id = fields
+        doc_counts[topic_id] = doc_counts.get(topic_id, 0) + 1
         if q0 != "Q0":
             violations.append(f"line {line_no}: second column must be 'Q0', got {q0!r}")
         if not docid:
@@ -85,6 +92,21 @@ def validate_retrieval_run(
         missing = expected_topic_ids - seen_topic_ids
         if missing:
             violations.append(f"missing output for {len(missing)} topic(s): {sorted(missing)[:10]}")
+
+    # Soft check, not a rigid "must equal N": the track wants a variable
+    # per-narrative k, so this only flags a topic whose count is far below
+    # what the rest of the run produced -- a plausible sign of a partial or
+    # failed topic rather than a deliberately short, well-covered narrative.
+    if len(doc_counts) > 1:
+        median = statistics.median(doc_counts.values())
+        threshold = max(1.0, min_doc_ratio * median)
+        for topic_id, count in sorted(doc_counts.items()):
+            if count < threshold:
+                violations.append(
+                    f"topic {topic_id}: only {count} retrieved document(s), well below the "
+                    f"median {median:.0f} across this run — verify this is an intentionally "
+                    "short list, not a partial/failed topic"
+                )
 
     return violations
 
@@ -124,10 +146,9 @@ def validate_rag_jsonl(
         answer = record.get("answer", [])
 
         if isinstance(metadata, dict):
-            extra_keys = set(metadata) - _ALLOWED_METADATA_KEYS
-            if extra_keys:
-                violations.append(f"{prefix}: metadata has disallowed extra keys {sorted(extra_keys)}")
-            missing_keys = _ALLOWED_METADATA_KEYS - set(metadata)
+            # Extra metadata keys are explicitly permitted: "metadata: may also
+            # contain any additional participant-defined fields" (rag-task.md).
+            missing_keys = _REQUIRED_METADATA_KEYS - set(metadata)
             if missing_keys:
                 violations.append(f"{prefix}: metadata missing keys {sorted(missing_keys)}")
 
@@ -152,6 +173,14 @@ def validate_rag_jsonl(
         if not isinstance(answer, list):
             violations.append(f"{prefix}: 'answer' must be a list")
             answer = []
+
+        # An empty answer is syntactically valid but scores zero, and every other
+        # check below passes vacuously on one -- so without this the validator
+        # cheerfully reports "All checks passed" on a dead narrative.
+        if isinstance(answer, list) and not answer:
+            violations.append(f"{prefix}: 'answer' is empty (this narrative would score zero)")
+        if isinstance(references, list) and not references:
+            violations.append(f"{prefix}: 'references' is empty (nothing is cited)")
 
         cited_reference_indices: set[int] = set()
         total_words = 0
@@ -181,11 +210,13 @@ def validate_rag_jsonl(
         if total_words > max_words:
             violations.append(f"{prefix}: answer is {total_words} words, exceeds max {max_words}")
 
+        # Deliberately not a violation: rag-task.md says "Do not reject or penalize
+        # a RAG object because `references` contains uncited document IDs."
         uncited = set(range(len(references))) - cited_reference_indices
         if uncited:
-            violations.append(
-                f"{prefix}: {len(uncited)} reference(s) not cited by any answer sentence "
-                f"(indices {sorted(uncited)[:10]})"
+            _logger.info(
+                "%s: %d reference(s) uncited (allowed by the spec, not a violation)",
+                prefix, len(uncited),
             )
 
     if topics_by_id is not None:

@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>From Question to Grounded Answer — Pipeline Diagram</title>
+<style>
+  :root{
+    --ink:#1c2130;
+    --paper:#f5f6f9;
+    --panel:#ffffff;
+    --line:#dde1e8;
+    --muted:#5b6270;
+    --c-retrieval:#3f7ea6;
+    --c-rerank:#7860a8;
+    --c-gen:#c9852f;
+
+    --font-display:'Iowan Old Style','Palatino Linotype',Palatino,'Book Antiqua',Georgia,serif;
+    --font-body:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+    --font-mono:'SF Mono','Cascadia Code',Consolas,'Liberation Mono',monospace;
+  }
+
+  @media (prefers-color-scheme: dark){
+    :root{
+      --ink:#eef0f4;
+      --paper:#12141b;
+      --panel:#181b24;
+      --line:#2b2f3a;
+      --muted:#9aa2b1;
+      --c-retrieval:#6fb0d9;
+      --c-rerank:#a892d6;
+      --c-gen:#e3a256;
+    }
+  }
+  :root[data-theme="dark"]{
+    --ink:#eef0f4; --paper:#12141b; --panel:#181b24; --line:#2b2f3a; --muted:#9aa2b1;
+    --c-retrieval:#6fb0d9; --c-rerank:#a892d6; --c-gen:#e3a256;
+  }
+  :root[data-theme="light"]{
+    --ink:#1c2130; --paper:#f5f6f9; --panel:#ffffff; --line:#dde1e8; --muted:#5b6270;
+    --c-retrieval:#3f7ea6; --c-rerank:#7860a8; --c-gen:#c9852f;
+  }
+
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; background:var(--paper); }
+
+  .page{
+    max-width:760px;
+    margin:0 auto;
+    padding:56px 24px 88px;
+    background:var(--paper);
+    color:var(--ink);
+    font-family:var(--font-body);
+  }
+
+  .intro{
+    text-align:center;
+    max-width:56ch;
+    margin:0 auto 56px;
+  }
+  .eyebrow{
+    font-size:0.72rem;
+    text-transform:uppercase;
+    letter-spacing:0.16em;
+    color:var(--muted);
+    margin:0 0 14px;
+  }
+  h1{
+    font-family:var(--font-display);
+    font-size:clamp(1.7rem, 4vw, 2.35rem);
+    line-height:1.15;
+    margin:0 0 16px;
+    text-wrap:balance;
+    font-weight:600;
+  }
+  .lede{
+    color:var(--muted);
+    font-size:1rem;
+    line-height:1.6;
+    margin:0 auto;
+  }
+
+  .funnel{
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+  }
+
+  .node{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:999px;
+    padding:14px 28px;
+    text-align:center;
+  }
+  .node-title{
+    display:block;
+    font-family:var(--font-display);
+    font-size:1.05rem;
+    font-weight:600;
+  }
+  .node-desc{
+    display:block;
+    color:var(--muted);
+    font-size:0.85rem;
+    margin-top:4px;
+    max-width:34ch;
+  }
+  .node.answer{
+    background:var(--c-gen);
+    border-color:var(--c-gen);
+    color:#fff;
+  }
+
+  .connector{
+    width:2px;
+    height:30px;
+    position:relative;
+    background:var(--pc, var(--line));
+  }
+  .connector::after{
+    content:"";
+    position:absolute;
+    left:50%; bottom:-1px;
+    transform:translateX(-50%);
+    width:0; height:0;
+    border-left:5px solid transparent;
+    border-right:5px solid transparent;
+    border-top:6px solid var(--pc, var(--line));
+  }
+
+  .phase{
+    width:100%;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+  }
+  .phase-label{
+    font-size:0.72rem;
+    text-transform:uppercase;
+    letter-spacing:0.14em;
+    font-weight:600;
+    color:var(--pc);
+    margin:0 0 18px;
+  }
+
+  .stage{
+    width:var(--w);
+    max-width:640px;
+    margin:0 auto;
+    background:var(--panel);
+    border:1px solid var(--line);
+    padding:16px 22px;
+    text-align:left;
+  }
+  .stage-head{
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    gap:14px;
+  }
+  .stage-head h2{
+    font-family:var(--font-display);
+    font-size:1.05rem;
+    font-weight:600;
+    margin:0;
+    text-wrap:balance;
+  }
+  .count{
+    font-family:var(--font-mono);
+    font-variant-numeric:tabular-nums;
+    font-size:0.78rem;
+    color:var(--pc);
+    border:1px solid var(--pc);
+    padding:2px 9px;
+    white-space:nowrap;
+    flex:none;
+  }
+  .stage p{
+    margin:8px 0 0;
+    color:var(--muted);
+    font-size:0.92rem;
+    line-height:1.55;
+  }
+
+  .pair{
+    display:flex;
+    gap:18px;
+    justify-content:center;
+    width:100%;
+  }
+  .pair .stage{
+    width:230px;
+    text-align:center;
+  }
+  .pair .stage h2{ font-size:0.98rem; }
+
+  .outro{
+    text-align:center;
+    max-width:46ch;
+    margin:40px auto 0;
+    color:var(--muted);
+    font-size:0.9rem;
+    line-height:1.6;
+  }
+
+  @media (max-width: 640px){
+    .stage{ width:100%; }
+    .pair{ flex-direction:column; align-items:center; }
+    .pair .stage{ width:100%; max-width:320px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <header class="intro">
+    <p class="eyebrow">Retrieval-Augmented Generation &middot; TREC RAG 2026</p>
+    <h1>From Question to Grounded Answer</h1>
+    <p class="lede">A single query moves through a funnel of retrieval and reranking stages, narrowing from roughly a thousand candidate passages down to one cited answer.</p>
+  </header>
+
+  <div class="funnel">
+
+    <div class="node seed">
+      <span class="node-title">Query</span>
+      <span class="node-desc">The input research question enters the pipeline.</span>
+    </div>
+    <div class="connector" style="--pc:var(--c-retrieval)"></div>
+
+    <section class="phase" data-phase="retrieval" style="--pc:var(--c-retrieval)">
+      <p class="phase-label">Retrieval</p>
+
+      <div class="stage" style="--w:100%">
+        <div class="stage-head"><h2>Keyword Search</h2><span class="count">1,000</span></div>
+        <p>A broad, exact-match search across the full corpus surfaces the initial pool of candidate passages.</p>
+      </div>
+      <div class="connector" style="--pc:var(--c-retrieval)"></div>
+
+      <div class="stage" style="--w:93%">
+        <div class="stage-head"><h2>Semantic Re-scoring</h2><span class="count">1,000</span></div>
+        <p>The same candidates are compared to the query by meaning rather than wording &mdash; an exhaustive comparison against every candidate, not an approximate shortcut.</p>
+      </div>
+      <div class="connector" style="--pc:var(--c-retrieval)"></div>
+
+      <div class="stage" style="--w:85%">
+        <div class="stage-head"><h2>Combine Rankings</h2><span class="count">500</span></div>
+        <p>The keyword-based and meaning-based rankings are fused into a single ordered list.</p>
+      </div>
+    </section>
+
+    <div class="connector" style="background:linear-gradient(var(--c-retrieval), var(--c-rerank)); --pc:var(--c-rerank)"></div>
+
+    <section class="phase" data-phase="rerank" style="--pc:var(--c-rerank)">
+      <p class="phase-label">Reranking Cascade</p>
+
+      <div class="stage" style="--w:77%">
+        <div class="stage-head"><h2>Learned Ranking</h2><span class="count">200</span></div>
+        <p>A trained model blends every signal gathered so far into a single, more reliable ranking.</p>
+      </div>
+      <div class="connector" style="--pc:var(--c-rerank)"></div>
+
+      <div class="stage" style="--w:69%">
+        <div class="stage-head"><h2>Fine-Grained Matching</h2><span class="count">100</span></div>
+        <p>Passages are compared to the query piece by piece for closer alignment, rather than as whole documents.</p>
+      </div>
+      <div class="connector" style="--pc:var(--c-rerank)"></div>
+
+      <div class="stage" style="--w:61%">
+        <div class="stage-head"><h2>Query &amp; Entity Focus</h2><span class="count">80</span></div>
+        <p>Extra attention is paid to the query's key terms and named entities, blended with the earlier retrieval signal.</p>
+      </div>
+      <div class="connector" style="--pc:var(--c-rerank)"></div>
+
+      <div class="stage" style="--w:53%">
+        <div class="stage-head"><h2>Joint Scoring</h2><span class="count">50</span></div>
+        <p>Each remaining passage is scored directly against the query as a matched pair &mdash; the most precise comparison in the cascade.</p>
+      </div>
+      <div class="connector" style="--pc:var(--c-rerank)"></div>
+
+      <div class="stage" style="--w:45%">
+        <div class="stage-head"><h2>Final Reordering</h2><span class="count">20</span></div>
+        <p>A language model reviews the short list as a whole and reorders it for overall coherence.</p>
+      </div>
+    </section>
+
+    <div class="connector" style="background:linear-gradient(var(--c-rerank), var(--c-gen)); --pc:var(--c-gen)"></div>
+
+    <section class="phase" data-phase="gen" style="--pc:var(--c-gen)">
+      <p class="phase-label">Generation &amp; Output</p>
+
+      <div class="stage" style="--w:38%">
+        <div class="stage-head"><h2>Evidence Selection</h2><span class="count">10</span></div>
+        <p>The top few passages are set aside as supporting evidence for the answer.</p>
+      </div>
+      <div class="connector" style="--pc:var(--c-gen)"></div>
+
+      <div class="stage" style="--w:34%">
+        <div class="stage-head"><h2>Answer Writing</h2></div>
+        <p>A grounded answer is drafted from that evidence, sentence by sentence.</p>
+      </div>
+      <div class="connector" style="--pc:var(--c-gen)"></div>
+
+      <div class="stage" style="--w:30%">
+        <div class="stage-head"><h2>Rule Enforcement</h2></div>
+        <p>Citation limits, length limits, and reference rules are applied before anything is saved.</p>
+      </div>
+      <div class="connector" style="--pc:var(--c-gen)"></div>
+
+      <div class="pair">
+        <div class="stage"><h2>Ranked List</h2><p>Every judged passage, in order.</p></div>
+        <div class="stage"><h2>Cited Answer</h2><p>The written, sourced response.</p></div>
+      </div>
+      <div class="connector" style="--pc:var(--c-gen)"></div>
+
+      <div class="stage" style="--w:26%">
+        <div class="stage-head"><h2>Validation</h2></div>
+        <p>Both deliverables are checked against the required format before submission.</p>
+      </div>
+    </section>
+
+    <div class="connector" style="--pc:var(--c-gen)"></div>
+    <div class="node answer">
+      <span class="node-title">Answer Delivered</span>
+    </div>
+  </div>
+
+  <p class="outro">Every stage after the first search can be skipped on its own &mdash; the pipeline degrades gracefully rather than failing outright when a later stage isn't available.</p>
+
+</div>
+
+</body>
+</html>

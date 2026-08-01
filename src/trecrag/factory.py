@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from trecrag.chunking import PassageSelector
 from trecrag.clients.llm_client import AnthropicClient, IdentityLLMClient, LLMClient, OpenAICompatibleClient
 from trecrag.clients.pyserini_client import PyseriniClient
 from trecrag.config import get_env, require_env
@@ -50,7 +51,12 @@ def build_llm_client(
     if backend == "openai":
         base_url = require_env(llm_config["base_url_env"], hint="LLM base URL")
         return OpenAICompatibleClient(
-            base_url=base_url, api_key=api_key, model=model, timeout_seconds=timeout_seconds
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            max_attempts=int(llm_config.get("max_attempts", 3)),
+            retry_backoff=float(llm_config.get("retry_backoff_seconds", 5.0)),
         )
     if backend == "anthropic":
         return AnthropicClient(api_key=api_key, model=model, timeout_seconds=timeout_seconds)
@@ -65,6 +71,19 @@ def build_pyserini_client(config: dict[str, Any]) -> PyseriniClient:
         token=get_env(pyserini_config.get("token_env")),
         timeout_seconds=float(pyserini_config.get("timeout_seconds", 20)),
         max_retries=int(pyserini_config.get("max_retries", 3)),
+        cache_dir=pyserini_config.get("cache_dir"),
+        backoff_factor=float(pyserini_config.get("backoff_factor", 0.5)),
+    )
+
+
+def build_passage_selector(cfg: dict[str, Any]) -> PassageSelector | None:
+    if not cfg.get("enabled", False):
+        return None
+    return PassageSelector(
+        window_chars=int(cfg.get("window_chars", 2000)),
+        stride_chars=int(cfg.get("stride_chars", 1000)),
+        windows_per_doc=int(cfg.get("windows_per_doc", 2)),
+        min_doc_chars=int(cfg.get("min_doc_chars", 2000)),
     )
 
 
@@ -73,7 +92,13 @@ def build_biencoder(biencoder_cfg: dict[str, Any]) -> BiencoderRetriever | None:
         return None
     encoder: Encoder
     if biencoder_cfg.get("backend", "hashing") == "sentence_transformer":
-        encoder = SentenceTransformerEncoder(biencoder_cfg["model_name"])
+        encoder = SentenceTransformerEncoder(
+            biencoder_cfg["model_name"],
+            device=biencoder_cfg.get("device"),
+            batch_size=int(biencoder_cfg.get("batch_size", 128)),
+            query_prefix=biencoder_cfg.get("query_prefix", ""),
+            passage_prefix=biencoder_cfg.get("passage_prefix", ""),
+        )
     else:
         encoder = HashingEncoder(dims=int(biencoder_cfg.get("dims", 768)))
     return BiencoderRetriever(encoder, pool_size=int(biencoder_cfg.get("pool_size", 1000)))
@@ -93,7 +118,11 @@ def build_colbert(colbert_cfg: dict[str, Any]) -> ColBERTReranker | None:
     if not colbert_cfg.get("enabled", True):
         return None
     if colbert_cfg.get("backend", "hashing") == "transformer":
-        token_encoder = TransformerTokenEncoder(colbert_cfg["model_name"])
+        token_encoder = TransformerTokenEncoder(
+            colbert_cfg["model_name"],
+            device=colbert_cfg.get("device"),
+            batch_size=int(colbert_cfg.get("batch_size", 32)),
+        )
     else:
         token_encoder = HashingTokenEncoder()
     return ColBERTReranker(
@@ -108,9 +137,18 @@ def build_qder(qder_cfg: dict[str, Any]) -> QDERReranker | None:
         return None
 
     use_entities = bool(qder_cfg.get("use_entities", False))
+    entity_provider_name = qder_cfg.get("entity_provider", "none")
     entity_provider: EntityEmbeddingProvider
-    if use_entities and qder_cfg.get("entity_provider", "none") == "heuristic":
-        entity_provider = HeuristicEntityProvider()
+    if use_entities:
+        if entity_provider_name == "heuristic":
+            entity_provider = HeuristicEntityProvider()
+        else:
+            raise ValueError(
+                f"stages.qder.use_entities is true but stages.qder.entity_provider "
+                f"is {entity_provider_name!r} — this would build QDERModel with an "
+                "active entity channel that only ever receives zero placeholder "
+                "vectors. Set entity_provider: heuristic, or use_entities: false."
+            )
     else:
         entity_provider = NullEntityProvider()
 
@@ -144,7 +182,11 @@ def build_cross_encoder(ce_cfg: dict[str, Any]) -> CrossEncoderReranker | None:
     if not ce_cfg.get("enabled", True):
         return None
     if ce_cfg.get("backend", "lexical") == "sentence_transformer":
-        scorer = SentenceTransformersCrossEncoderScorer(ce_cfg["model_name"])
+        scorer = SentenceTransformersCrossEncoderScorer(
+            ce_cfg["model_name"],
+            device=ce_cfg.get("device"),
+            batch_size=int(ce_cfg.get("batch_size", 64)),
+        )
     else:
         scorer = LexicalOverlapScorer()
     return CrossEncoderReranker(scorer)
@@ -169,6 +211,31 @@ def build_generator(generation_cfg: dict[str, Any], llm_cfg: dict[str, Any]) -> 
         llm = build_llm_client(generation_cfg.get("llm_backend", "openai"), llm_cfg)
         return LLMGenerator(llm)
     return ExtractiveGenerator()
+
+
+def _validate_output_depth(depths: StageDepths, output_depth: int | None) -> None:
+    """`retrieval_output.depth` is only ever honoured if every stage between the
+    cascade's end and the final rerank still carries at least that many
+    candidates — `RagPipeline.retrieve()` truncates to each stage's `top_k` in
+    sequence, so a smaller downstream `top_k` silently caps the submitted
+    depth regardless of what this config value says. Fail at build time
+    instead of silently shipping a shorter run."""
+    if output_depth is None:
+        return
+    bottlenecks = {
+        "stages.colbert.top_k": depths.colbert_top_k,
+        "stages.qder.top_k": depths.qder_top_k,
+        "stages.cross_encoder.top_k": depths.ce_top_k,
+        "stages.llm_listwise.top_k": depths.llm_listwise_top_k,
+    }
+    too_small = {name: v for name, v in bottlenecks.items() if v < output_depth}
+    if too_small:
+        raise ValueError(
+            f"retrieval_output.depth ({output_depth}) exceeds these stage top_k "
+            f"values, so RagPipeline.retrieve() can never return that many "
+            f"candidates: {too_small}. Raise each to at least {output_depth}, "
+            "or lower retrieval_output.depth."
+        )
 
 
 def build_pipeline_from_config(config: dict[str, Any]) -> RagPipeline:
@@ -201,11 +268,15 @@ def build_pipeline_from_config(config: dict[str, Any]) -> RagPipeline:
         max_citations_per_sentence=int(generation_cfg.get("max_citations_per_sentence", 3)),
     )
 
+    output_depth_cfg = config.get("retrieval_output", {}).get("depth")
+    _validate_output_depth(depths, int(output_depth_cfg) if output_depth_cfg is not None else None)
+
     return RagPipeline(
         bm25=bm25,
         depths=depths,
         generation=generation,
         generator=build_generator(generation_cfg, llm_cfg),
+        passage_selector=build_passage_selector(stages.get("passage_selection", {})),
         biencoder=build_biencoder(stages.get("biencoder", {})),
         ltr=build_ltr(ltr_cfg),
         colbert=build_colbert(colbert_cfg),

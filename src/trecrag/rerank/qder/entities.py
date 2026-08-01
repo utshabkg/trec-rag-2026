@@ -53,10 +53,25 @@ class HeuristicEntityProvider(EntityEmbeddingProvider):
     def _mentions(self, text: str, max_entities: int) -> list[str]:
         seen: list[str] = []
         for match in _ENTITY_MENTION_RE.finditer(text):
-            phrase = match.group(0)
-            first_word = phrase.split(" ", 1)[0]
-            if len(phrase) < 3 or first_word in _LEADING_STOPWORDS:
+            words = match.group(0).split()
+            if words and words[0] in _LEADING_STOPWORDS:
+                # Strip only the leading stopword ("The Eiffel Tower" -> "Eiffel
+                # Tower") rather than discarding the whole match, which used to
+                # throw away the real entity along with the stopword.
+                words = words[1:]
+            if not words:
                 continue
+            phrase = " ".join(words)
+
+            # A single Title-Case word is usually just sentence-initial
+            # capitalization (English capitalizes sentence starts), not a real
+            # entity -- require 2+ consecutive capitalized words, with a
+            # dedicated exception for short real acronyms ("US", "AI", "NASA").
+            is_multi_word = len(words) >= 2
+            is_acronym = len(words) == 1 and words[0].isupper() and 2 <= len(words[0]) <= 6
+            if not (is_multi_word or is_acronym):
+                continue
+
             if phrase not in seen:
                 seen.append(phrase)
             if len(seen) >= max_entities:

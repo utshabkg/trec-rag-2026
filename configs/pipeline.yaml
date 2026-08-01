@@ -14,6 +14,20 @@ stages:
   bm25:
     hits: 1000
 
+  # ClimbMix documents are whole pages/books: measured mean 66,685 chars, median
+  # 42,948, and NOT ONE of 1000 candidates was under 2000 chars. Every downstream
+  # stage truncates its input, so without this they all score and cite each
+  # document's title page. Measured over 200 real candidates: the leading window
+  # was the best window in only 10/200 docs, the median best window began at
+  # char 15,900, and selecting it raised query overlap 32%. CPU-only, ~1.7s per
+  # 1000-candidate topic.
+  passage_selection:
+    enabled: true
+    window_chars: 2000        # ~512 tokens, matching the e5/CE input limits
+    stride_chars: 1000
+    windows_per_doc: 2        # narratives are multi-faceted; one span rarely covers them
+    min_doc_chars: 2000       # already passage-sized: leave untouched
+
   biencoder:
     enabled: true
     backend: hashing            # hashing | sentence_transformer
@@ -49,7 +63,7 @@ stages:
     enabled: true
     backend: hashing            # hashing | transformer
     model_name: "bert-base-uncased"   # only used when backend: transformer
-    model_path: null            # trained checkpoint from SIGIR2025-QDER's src/doc_ranking/train.py; null = untrained
+    model_path: null            # trained checkpoint from third_party/qder_training/train.py (unwrapped, see its README); null = untrained
     score_method: bilinear      # linear | bilinear (transformer backend only)
     use_entities: false         # entity channel needs an EntityEmbeddingProvider (no WAT/Wikipedia2Vec for ClimbMix here)
     entity_provider: heuristic  # none | heuristic (capitalized-phrase spotting + hashed vectors; only used if use_entities: true)
@@ -57,13 +71,13 @@ stages:
     hybrid_lambda: 0.5          # score_hybrid = lambda*bm25 + (1-lambda)*qder; null disables interpolation (fixed stand-in for the paper's coordinate-ascent-tuned lambda)
     max_query_tokens: 32
     max_doc_tokens: 256
-    top_k: 80
+    top_k: 100
 
   cross_encoder:
     enabled: true
     backend: lexical            # lexical | sentence_transformer
     model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    top_k: 50
+    top_k: 100
 
   llm_listwise:
     enabled: true
@@ -72,8 +86,12 @@ stages:
     window_size: 20
     step: 10
     max_passage_chars: 300
-    top_k: 20
+    top_k: 100
 
+# `depth` must not exceed any of stages.{colbert,qder,cross_encoder,llm_listwise}.top_k above —
+# RagPipeline.retrieve() truncates to each stage's top_k in sequence, so a smaller downstream
+# top_k silently caps the submitted depth. factory.py::_validate_output_depth enforces this at
+# pipeline-build time.
 retrieval_output:
   filename: "r_output_trec_rag_2026.tsv"
   depth: 100
@@ -91,3 +109,5 @@ llm:
   api_key_env: "LLM_API_KEY"
   model_env: "LLM_MODEL"
   timeout_seconds: 60
+  max_attempts: 3           # retries RequestException + malformed (KeyError/ValueError) payloads
+  retry_backoff_seconds: 5.0

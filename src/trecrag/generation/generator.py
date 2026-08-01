@@ -10,7 +10,6 @@ or unparsable.
 from __future__ import annotations
 
 import json
-import re
 from abc import ABC, abstractmethod
 
 from trecrag.clients.llm_client import LLMClient
@@ -18,7 +17,31 @@ from trecrag.generation.postprocess import postprocess_rag_answer
 from trecrag.schema import AnswerSentence, Candidate, RagAnswer, Topic
 from trecrag.text_utils import split_sentences, tokenize
 
-_JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _find_json_array(response: str) -> list | None:
+    """Find the first well-formed JSON array in `response`.
+
+    A single greedy `re.compile(r"\\[.*\\]")` spans from the first `[` to the
+    *last* `]` in the whole response -- if the model appends anything
+    bracketed after the array (e.g. "Sources: [0], [2]"), that match captures
+    invalid JSON and `json.loads` fails, needlessly falling back to the
+    extractive generator even though a well-formed array was present earlier.
+    Scanning with the real parser at every `[` is robust to that, and to
+    brackets/string literals nested inside the array itself.
+    """
+    start = response.find("[")
+    while start != -1:
+        try:
+            value, _ = _JSON_DECODER.raw_decode(response, start)
+        except json.JSONDecodeError:
+            start = response.find("[", start + 1)
+            continue
+        if isinstance(value, list):
+            return value
+        start = response.find("[", start + 1)
+    return None
 
 
 class Generator(ABC):
@@ -73,14 +96,23 @@ class LLMGenerator(Generator):
             return RagAnswer(references=[], sentences=[])
 
         prompt = self._build_prompt(topic, usable, max_words, max_citations)
-        response = self.llm.complete(prompt, max_tokens=2048)
+        # A 1024-word cited answer is ~1900 tokens of JSON; 2048 truncated the
+        # array often enough that the parse failed and silently dropped to the
+        # extractive fallback.
+        response = self.llm.complete(prompt, max_tokens=4096)
         parsed = self._parse_response(response, len(usable))
         if parsed is None:
             return self.fallback.generate(topic, evidence, max_words, max_citations)
 
         references = [c.docid for c in usable]
         sentences = [AnswerSentence(text=s["text"], citations=s["citations"]) for s in parsed]
-        return postprocess_rag_answer(references, sentences, max_words, max_citations)
+        answer = postprocess_rag_answer(references, sentences, max_words, max_citations)
+        if not answer.sentences:
+            # Parsed fine but nothing survived post-processing (e.g. every
+            # citation was unusable), which would submit an empty answer and
+            # score zero for this narrative. An extractive answer beats none.
+            return self.fallback.generate(topic, evidence, max_words, max_citations)
+        return answer
 
     @staticmethod
     def _build_prompt(
@@ -94,13 +126,22 @@ class LLMGenerator(Generator):
             "Evidence passages:",
         ]
         for i, candidate in enumerate(usable):
-            lines.append(f"[{i}] {(candidate.text or '')[:1500]}")
+            lines.append(f"[{i}] {(candidate.text or '')[:2500]}")
         lines += [
             "",
-            f"Write an answer of at most {max_words} words, as a JSON array of objects "
-            'with "text" and "citations".',
+            # These narratives bundle several distinct sub-questions and are scored
+            # on how much of the expected content the answer covers, so an explicit
+            # length target matters: "at most N words" alone reliably produced
+            # ~250-word answers against a 1024-word budget.
+            f"Write a thorough answer of {int(max_words * 0.6)}-{int(max_words * 0.9)} "
+            f"words (hard maximum {max_words}), as a JSON array of objects with "
+            '"text" and "citations".',
+            "Identify every distinct sub-question the request asks and address each "
+            "one explicitly; breadth of coverage matters more than depth on any "
+            "single point. If the evidence does not cover a sub-question, say so "
+            "rather than inventing an answer.",
             f'"citations" must be a list of at most {max_citations} zero-based indices '
-            "into the evidence passages above.",
+            "into the evidence passages above, ordered strongest support first.",
             "Every sentence must be supported by at least one cited passage. Do not "
             "invent facts absent from the evidence.",
             'Respond with only the JSON array, e.g. [{"text": "...", "citations": [0, 2]}].',
@@ -109,14 +150,8 @@ class LLMGenerator(Generator):
 
     @staticmethod
     def _parse_response(response: str, num_evidence: int) -> list[dict] | None:
-        match = _JSON_ARRAY_RE.search(response)
-        if not match:
-            return None
-        try:
-            data = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(data, list):
+        data = _find_json_array(response)
+        if data is None:
             return None
 
         parsed = []
@@ -126,6 +161,19 @@ class LLMGenerator(Generator):
             citations = item.get("citations", [])
             if not isinstance(citations, list):
                 citations = []
-            citations = [c for c in citations if isinstance(c, int) and 0 <= c < num_evidence]
+            # Models routinely emit "0" instead of 0; dropping those would strip a
+            # sentence of all citations and get it deleted in post-processing. bool
+            # is a subclass of int in Python, so it's excluded explicitly -- an
+            # unguarded isinstance(c, int) would silently accept True/False as
+            # citation indices 1/0.
+            coerced = []
+            for c in citations:
+                if isinstance(c, bool):
+                    continue
+                if isinstance(c, int):
+                    coerced.append(c)
+                elif isinstance(c, str) and c.strip().lstrip("-").isdigit():
+                    coerced.append(int(c.strip()))
+            citations = [c for c in coerced if 0 <= c < num_evidence]
             parsed.append({"text": str(item["text"]), "citations": citations})
         return parsed or None

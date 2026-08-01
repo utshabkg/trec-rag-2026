@@ -25,6 +25,15 @@ class TokenEncoder(ABC):
     def encode_tokens(self, text: str, max_tokens: int) -> np.ndarray:
         """Return an [T, dims] matrix of (approximately) unit-norm token vectors."""
 
+    def encode_tokens_batch(self, texts: list[str], max_tokens: int) -> list[np.ndarray]:
+        """Encode many texts at once, returning one [T_i, dims] matrix per text.
+
+        The default loops `encode_tokens()`, which suits the dependency-free
+        fallback. Model-backed encoders override this so a candidate list costs
+        one padded forward pass instead of one pass per document.
+        """
+        return [self.encode_tokens(text, max_tokens) for text in texts]
+
 
 class HashingTokenEncoder(TokenEncoder):
     def __init__(self, dims: int = 256):
@@ -43,7 +52,7 @@ class HashingTokenEncoder(TokenEncoder):
 
 
 class TransformerTokenEncoder(TokenEncoder):
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, device: str | None = None, batch_size: int = 32):
         try:
             import torch
             from transformers import AutoModel, AutoTokenizer
@@ -53,20 +62,39 @@ class TransformerTokenEncoder(TokenEncoder):
                 "pip install trecrag[neural]"
             ) from exc
         self._torch = torch
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.batch_size = batch_size
         self._tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self._model = AutoModel.from_pretrained(model_name)
+        self._model = AutoModel.from_pretrained(model_name).to(self.device)
         self._model.eval()
 
     def encode_tokens(self, text: str, max_tokens: int) -> np.ndarray:
+        return self.encode_tokens_batch([text], max_tokens)[0]
+
+    def encode_tokens_batch(self, texts: list[str], max_tokens: int) -> list[np.ndarray]:
+        if not texts:
+            return []
         torch = self._torch
-        inputs = self._tokenizer(
-            text, truncation=True, max_length=max_tokens, return_tensors="pt"
-        )
-        with torch.no_grad():
-            outputs = self._model(**inputs)
-        embeddings = outputs.last_hidden_state[0]
-        norms = embeddings.norm(dim=-1, keepdim=True).clamp(min=1e-9)
-        return (embeddings / norms).numpy().astype(np.float32)
+        results: list[np.ndarray] = []
+        for start in range(0, len(texts), self.batch_size):
+            chunk = texts[start : start + self.batch_size]
+            inputs = self._tokenizer(
+                chunk,
+                truncation=True,
+                max_length=max_tokens,
+                padding=True,
+                return_tensors="pt",
+            ).to(self.device)
+            with torch.no_grad():
+                outputs = self._model(**inputs)
+            hidden = outputs.last_hidden_state
+            norms = hidden.norm(dim=-1, keepdim=True).clamp(min=1e-9)
+            normalized = (hidden / norms).cpu().numpy().astype(np.float32)
+            # Drop padded positions so MaxSim only ever sees real tokens.
+            lengths = inputs["attention_mask"].sum(dim=1).tolist()
+            for row, length in zip(normalized, lengths):
+                results.append(row[: int(length)])
+        return results
 
 
 def max_sim(query_tokens: np.ndarray, doc_tokens: np.ndarray) -> float:
@@ -93,11 +121,11 @@ class ColBERTReranker(Reranker):
         if not candidates:
             return []
         query_matrix = self.token_encoder.encode_tokens(topic.text, self.max_query_tokens)
-        scores = []
-        for candidate in candidates:
-            if not candidate.text:
-                scores.append(float("-inf"))
-                continue
-            doc_matrix = self.token_encoder.encode_tokens(candidate.text, self.max_doc_tokens)
-            scores.append(max_sim(query_matrix, doc_matrix))
+        scorable = [i for i, c in enumerate(candidates) if c.text]
+        doc_matrices = self.token_encoder.encode_tokens_batch(
+            [candidates[i].text for i in scorable], self.max_doc_tokens
+        )
+        scores = [float("-inf")] * len(candidates)
+        for i, doc_matrix in zip(scorable, doc_matrices):
+            scores[i] = max_sim(query_matrix, doc_matrix)
         return _resorted(candidates, scores, "colbert_score", k)
