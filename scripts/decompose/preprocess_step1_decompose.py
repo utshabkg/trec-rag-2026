@@ -28,13 +28,18 @@ QUICKSTART
         --model /media/20TB/shared/models/qwen/Qwen2.5-72B-Instruct-AWQ/models--Qwen--Qwen2.5-72B-Instruct-AWQ/snapshots/698703eae6604af048a3d2f509995dc302088217 \
         --output output_decomp/preprocessed_queries_step1.jsonl
 
-    # The GPUs must be free first -- a 39GB AWQ load needs both cards. Check with
-    # `nvidia-smi`; if Ollama is holding a model, it releases on keep_alive expiry.
+    # GPU_MEMORY_UTILIZATION defaults to "auto": it measures free VRAM at launch and
+    # sizes the allocation to fit beside whatever else is running, rather than
+    # assuming the cards are idle. This box is shared, so it refuses to start (with
+    # the numbers and a clear message) when too little would be left for a usable KV
+    # cache -- instead of loading and then batching one request at a time.
 
 MODEL NOTES (verified on this machine)
-  Qwen2.5-72B-Instruct-AWQ  awq 4-bit/group 128, 11 shards, ~39GB, HAS a chat
-                            template. Needs TENSOR_PARALLEL_SIZE=2 on 2x48GB, and
-                            the GPUs must be free (stop any Ollama model first).
+  Qwen2.5-72B-Instruct-AWQ  awq 4-bit/group 128, 11 shards, ~39GB (19.4 GiB/GPU at
+                            tp=2), HAS a chat template. This is the model to use.
+                            It needs both cards essentially idle: it does not fit
+                            beside another large resident model, and "auto" sizing
+                            will say so rather than OOM.
   gemma-4-31B-it            Gemma4ForConditionalGeneration, NOT quantized (~59GB),
                             and its tokenizer_config.json has NO chat_template.
                             CHAT_TEMPLATE_FALLBACK below handles that; verify the
@@ -75,7 +80,7 @@ ERROR_LOG_PATH = "output_decomp/preprocessed_queries_step1_errors.log"
 # Generation / runtime knobs.
 QUANTIZATION: str | None = None   # None = auto-detect from config.json (see resolve_quantization)
 TENSOR_PARALLEL_SIZE = 2          # 2x RTX 6000 Ada; a 72B AWQ checkpoint will not fit on one
-GPU_MEMORY_UTILIZATION = 0.90
+GPU_MEMORY_UTILIZATION = "auto"   # "auto" = size to whatever VRAM is free now
 MAX_MODEL_LEN = 8192              # topics are short; this keeps the KV cache small
 MAX_TOKENS = 1024                 # a decomposition is far shorter, but truncation fails the parse
 TEMPERATURE = 0.0                 # deterministic: this is extraction, not generation
@@ -357,6 +362,88 @@ def validate_final_record(record: Any) -> None:
 # --------------------------------------------------------------------------------
 
 
+def _gpu_memory_mib() -> list[tuple[int, int]]:
+    """(free, total) MiB per visible GPU, or [] if nvidia-smi is unavailable."""
+    import subprocess
+
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.free,memory.total",
+             "--format=csv,noheader,nounits"],
+            text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = []
+    for line in out.strip().splitlines():
+        free, total = (int(x.strip()) for x in line.split(","))
+        rows.append((free, total))
+    return rows
+
+
+def _weights_gib(model_path: str) -> float:
+    from glob import glob
+
+    files = glob(str(Path(model_path) / "*.safetensors")) or glob(
+        str(Path(model_path) / "*.bin")
+    )
+    return sum(Path(f).stat().st_size for f in files) / 1024**3
+
+
+def resolve_gpu_memory_utilization(
+    model_path: str,
+    tensor_parallel_size: int,
+    requested: float | str,
+    headroom_gib: float = 4.0,
+    use_fraction_of_free: float = 0.90,
+) -> float:
+    """Size the vLLM allocation to what is actually free right now.
+
+    vLLM takes `gpu_memory_utilization` as a fraction of TOTAL memory and
+    pre-allocates it at startup -- there is no grow/shrink. On a shared box where
+    another job already holds most of a card, the default 0.90 simply fails. This
+    computes the largest fraction that fits beside the current occupant.
+
+    It also refuses to start when the leftover headroom (budget minus weights)
+    is too small to hold a useful KV cache: vLLM would load and then batch one
+    request at a time, which is slower than not using vLLM at all, and reads as a
+    mysterious hang rather than an error.
+    """
+    if requested != "auto":
+        return float(requested)
+
+    gpus = _gpu_memory_mib()
+    if not gpus:
+        logger.warning("could not read GPU memory; falling back to 0.90")
+        return 0.90
+
+    gpus = gpus[:tensor_parallel_size]
+    free_gib = min(f for f, _ in gpus) / 1024
+    total_gib = min(t for _, t in gpus) / 1024
+    budget_gib = free_gib * use_fraction_of_free
+    util = round(budget_gib / total_gib, 3)
+
+    weights_per_gpu = _weights_gib(model_path) / max(1, tensor_parallel_size)
+    spare = budget_gib - weights_per_gpu
+    logger.info(
+        "GPU sizing: %.1f GiB free/GPU -> budget %.1f GiB (util=%.3f); "
+        "weights %.1f GiB/GPU; %.1f GiB left for KV cache",
+        free_gib, budget_gib, util, weights_per_gpu, spare,
+    )
+    if spare < headroom_gib:
+        raise SystemExit(
+            f"\nNot enough free GPU memory to run this model usefully.\n"
+            f"  free/GPU        : {free_gib:.1f} GiB\n"
+            f"  usable budget   : {budget_gib:.1f} GiB\n"
+            f"  weights need    : {weights_per_gpu:.1f} GiB/GPU "
+            f"(tensor_parallel_size={tensor_parallel_size})\n"
+            f"  left for KV     : {spare:.1f} GiB  (need >= {headroom_gib} GiB to batch)\n\n"
+            f"Check `nvidia-smi` for what else is running and wait for it, or pass an\n"
+            f"explicit --gpu-memory-utilization to override this check.\n"
+        )
+    return util
+
+
 def resolve_quantization(model_path: str, override: str | None) -> str | None:
     """Read quantization off the checkpoint's config.json.
 
@@ -491,7 +578,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--error-log", default=ERROR_LOG_PATH)
     parser.add_argument("--quantization", default=QUANTIZATION)
     parser.add_argument("--tensor-parallel-size", type=int, default=TENSOR_PARALLEL_SIZE)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=GPU_MEMORY_UTILIZATION)
+    parser.add_argument("--gpu-memory-utilization", default=GPU_MEMORY_UTILIZATION,
+                        help='float, or "auto" to fit alongside other GPU jobs')
     parser.add_argument("--max-model-len", type=int, default=MAX_MODEL_LEN)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--limit", type=int, default=None, help="only process the first N topics")
@@ -518,6 +606,9 @@ def main() -> None:
     from transformers import AutoTokenizer
     from vllm import LLM
 
+    gpu_util = resolve_gpu_memory_utilization(
+        args.model, args.tensor_parallel_size, args.gpu_memory_utilization
+    )
     quantization = resolve_quantization(args.model, args.quantization)
     logger.info("loading %s (quantization=%s, tp=%d)", args.model, quantization, args.tensor_parallel_size)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
@@ -525,7 +616,7 @@ def main() -> None:
         model=args.model,
         quantization=quantization,
         tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=args.gpu_memory_utilization,
+        gpu_memory_utilization=gpu_util,
         max_model_len=args.max_model_len,
         trust_remote_code=True,
         seed=SEED,
