@@ -58,7 +58,13 @@ stages:
     top_k: 500
 
   ltr:
-    enabled: true
+    # DISABLED: provably a no-op here. It reranks 500 -> 500 (no truncation, since
+    # hybrid emits 500), and the cross-encoder then re-sorts every candidate by its
+    # own score, so LTR's ordering is discarded wholesale. Verified empirically:
+    # 5/5 topics produce byte-identical final rankings with it on or off. There is
+    # also no trained model (zero-shot), so the linear fallback is only reordering
+    # by a weighted sum of signals the cross-encoder supersedes.
+    enabled: false
     model_path: null            # no dev qrels trained yet -> linear fallback
     feature_names: ["bm25_score", "bm25_rank", "bien_score", "bien_rank", "rrf_score"]
     weights:
@@ -102,8 +108,12 @@ stages:
     # Raised from 300 now that passage_selection guarantees these chars are the
     # query-relevant span rather than the document's opening boilerplate.
     max_passage_chars: 1200
-    # Reorders all 50 and returns all 50: truncation here would silently cap the
-    # R run. Same number of sliding windows either way, so this costs nothing.
+    # Returns all 50 so the R run keeps its depth, but only LLM-reranks the head.
+    # This stage is ~85% of runtime (one call per sliding window), and the head is
+    # what becomes the generator's evidence; below it the cross-encoder ordering is
+    # already reasonable. 50 candidates = 4 windows; 20 = 1. The tail is spliced
+    # back in cross-encoder order.
+    rerank_depth: 20
     top_k: 50
 
 retrieval_output:

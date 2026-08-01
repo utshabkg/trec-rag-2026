@@ -34,6 +34,35 @@ class TestLLMListwiseReranker(unittest.TestCase):
         reranker = LLMListwiseReranker(IdentityLLMClient())
         self.assertEqual(reranker.rerank(Topic("t1", "q"), [], k=5), [])
 
+    def test_rerank_depth_limits_llm_calls_but_keeps_every_candidate(self):
+        """This stage is ~85% of runtime, one call per sliding window. Limiting it
+        to the head must not drop candidates or break the run file's ordering
+        invariants, since the tail is spliced back on a different score scale."""
+
+        class CountingLLM(ReversingLLMClient):
+            calls = 0
+
+            def complete(self, prompt, *, max_tokens=1024):
+                type(self).calls += 1
+                return super().complete(prompt, max_tokens=max_tokens)
+
+        candidates = [
+            Candidate(docid=f"d{i}", score=100.0 - i, rank=i + 1, text=f"t{i}") for i in range(50)
+        ]
+        CountingLLM.calls = 0
+        out = LLMListwiseReranker(
+            CountingLLM(), window_size=20, step=10, rerank_depth=20
+        ).rerank(Topic("t1", "q"), candidates, k=50)
+
+        self.assertEqual(CountingLLM.calls, 1)  # 4 windows without rerank_depth
+        self.assertEqual(len(out), 50)
+        self.assertEqual(len({c.docid for c in out}), 50)
+        self.assertEqual([c.rank for c in out], list(range(1, 51)))
+        scores = [c.score for c in out]
+        self.assertTrue(all(scores[i] >= scores[i + 1] for i in range(len(scores) - 1)))
+        # the untouched tail keeps its upstream (cross-encoder) ordering
+        self.assertEqual([c.docid for c in out[20:]], [f"d{i}" for i in range(20, 50)])
+
     def test_parse_order_rejects_a_response_that_is_not_a_ranking(self):
         """None means 'keep the upstream order', not 'here is a ranking'.
 

@@ -31,15 +31,27 @@ class LLMListwiseReranker(Reranker):
         window_size: int = 20,
         step: int = 10,
         max_passage_chars: int = 300,
+        rerank_depth: int | None = None,
     ):
         self.llm = llm
         self.window_size = window_size
         self.step = step
         self.max_passage_chars = max_passage_chars
+        self.rerank_depth = rerank_depth
 
     def rerank(self, topic: Topic, candidates: list[Candidate], k: int) -> list[Candidate]:
         if not candidates:
             return []
+
+        # This stage dominates runtime -- one LLM call per sliding window, and the
+        # windows scale with how deep we rerank. `rerank_depth` limits it to the
+        # prefix that actually matters: the head becomes the generator's evidence,
+        # while the tail only pads the retrieval run, where the cross-encoder's
+        # ordering is already a reasonable answer. The tail is appended unchanged.
+        tail: list[Candidate] = []
+        if self.rerank_depth is not None and len(candidates) > self.rerank_depth:
+            candidates, tail = candidates[: self.rerank_depth], candidates[self.rerank_depth :]
+
         working = list(candidates)
         n = len(working)
         window = min(self.window_size, n)
@@ -54,9 +66,13 @@ class LLMListwiseReranker(Reranker):
             end = max(window, end - step)
             start = max(0, end - window)
 
-        top = working[:k]
+        top = (working + tail)[:k]
         for new_rank, candidate in enumerate(top, start=1):
             candidate.rank = new_rank
+            # Synthetic descending score: the run file requires non-increasing
+            # scores within a topic, and splicing a CE-ordered tail (whose scores
+            # are on a different scale) onto a listwise-ordered head would
+            # otherwise break monotonicity.
             candidate.score = float(len(top) - new_rank + 1)
             candidate.features["llm_listwise_rank"] = float(new_rank)
         return top

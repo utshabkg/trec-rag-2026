@@ -248,7 +248,61 @@ and forces a re-fetch of all 119 narratives. Not worth 25% of the evidence.
 help. Untested — response size (~60 MB at 1000) and §4.1 exposure make it
 impractical to push much further.
 
-### 5.4 Grounding
+### 5.4 Cascade width: LTR is a no-op, CE width is load-bearing, listwise was over-run
+
+Three proposals were raised together: drop LTR, shrink the cross-encoder's input
+(k1), shrink the listwise reranker's input (k2). Measured separately, they do not
+have the same answer.
+
+**LTR — remove it. Provably a no-op.** It reranked 500 → 500 (no truncation,
+since hybrid emits 500) and the cross-encoder then re-sorted every candidate by
+its own score, discarding LTR's ordering wholesale. Verified end to end: **5/5
+topics produce byte-identical final rankings with LTR enabled or disabled.** Now
+`enabled: false`. This also retires the "train the LTR model" item — under this
+topology a trained ranker would change nothing downstream.
+
+**Cross-encoder input — keep it wide.** Measured over 12 topics, tracking where
+each CE top-50 document sat in the RRF ordering it was handed:
+
+| RRF rank of doc | share of CE top-50 | share of top-10 evidence |
+|---|---|---|
+| 1–50 | 20.3% | 26.7% |
+| 51–100 | 12.7% | 12.5% |
+| 101–200 | 21.2% | 21.7% |
+| 201–350 | 24.2% | 20.8% |
+| 351–500 | 21.7% | 18.3% |
+
+Capping the CE's input would cost:
+
+| cap | lost from top-50 | lost from evidence |
+|---|---|---|
+| 100 | **67.0%** | 60.8% |
+| 200 | **45.8%** | 39.2% |
+| 350 | **21.7%** | 18.3% |
+
+Again near-uniform, and consistent with §5.3: **first-stage rank barely predicts
+final relevance**, so the cross-encoder — the only stage with real
+discrimination — finds its winners spread evenly through the pool. There is no
+cost argument either: batched, it scores 500 candidates in **0.24s** (~0.5 min
+for all 119 narratives). Width here is nearly free and demonstrably load-bearing.
+
+*Untested and cheap:* the distribution is flat all the way to 500, so `hybrid.top_k`
+(currently 500, out of a 1000-document BM25 pool) may itself be the limiting cut.
+Raising it to 1000 would cost ~0.5s/topic of CE time.
+
+**Listwise input — genuinely too wide.** This stage is ~85% of runtime, one LLM
+call per sliding window. It was reranking all 50 candidates (4 windows) when only
+the head becomes the generator's evidence. Added `rerank_depth`, set to 20: the
+LLM reranks the top 20 (**1 window**) and the tail is spliced back in
+cross-encoder order. **4 LLM calls → 1**, with the run still submitting 50
+documents and every ordering invariant intact (all candidates present, ranks
+1..N, scores non-increasing across the splice).
+
+Net: the two stages that were removed or narrowed are the ones that could not be
+shown to contribute; the one kept wide is the one measurement says is doing the
+work.
+
+### 5.5 Grounding
 
 Of 1,135 checkable sentences: 309 verbatim-match a cited doc, 33 match an
 uncited-but-present doc, the rest are paraphrase. **The failure mode is

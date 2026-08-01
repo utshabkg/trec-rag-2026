@@ -149,6 +149,7 @@ def build_llm_listwise(listwise_cfg: dict[str, Any], llm_cfg: dict[str, Any]) ->
         window_size=int(listwise_cfg.get("window_size", 20)),
         step=int(listwise_cfg.get("step", 10)),
         max_passage_chars=int(listwise_cfg.get("max_passage_chars", 300)),
+        rerank_depth=listwise_cfg.get("rerank_depth"),
     )
 
 
