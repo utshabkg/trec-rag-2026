@@ -16,15 +16,20 @@ Anything that fails twice is written to the flagged file instead, never dropped:
 every input query_id appears in exactly one of the two outputs.
 
 QUICKSTART
-    # vLLM is not in the trec-rag-2026 env; use one that has it:
-    conda activate agentic-search
-    python scripts/preprocess_step1_decompose.py
+    # Use the dedicated vLLM env, NOT trec-rag-2026. vLLM 0.13 pins torch 2.9,
+    # and the main pipeline runs torch 2.11 under sentence-transformers --
+    # installing vLLM alongside it would downgrade torch beneath a validated run.
+    conda activate trec-rag-2026-vllm
+    python scripts/decompose/preprocess_step1_decompose.py
 
     # or override the constants below:
-    python scripts/preprocess_step1_decompose.py \
+    python scripts/decompose/preprocess_step1_decompose.py \
         --topics trec_rag_2026_test_query_set.tsv \
         --model /media/20TB/shared/models/qwen/Qwen2.5-72B-Instruct-AWQ/models--Qwen--Qwen2.5-72B-Instruct-AWQ/snapshots/698703eae6604af048a3d2f509995dc302088217 \
         --output output_decomp/preprocessed_queries_step1.jsonl
+
+    # The GPUs must be free first -- a 39GB AWQ load needs both cards. Check with
+    # `nvidia-smi`; if Ollama is holding a model, it releases on keep_alive expiry.
 
 MODEL NOTES (verified on this machine)
   Qwen2.5-72B-Instruct-AWQ  awq 4-bit/group 128, 11 shards, ~39GB, HAS a chat
