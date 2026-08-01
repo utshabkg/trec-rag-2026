@@ -233,3 +233,4 @@ __marimo__/
 /output_*/
 *.jsonl.tmp
 
+logs/

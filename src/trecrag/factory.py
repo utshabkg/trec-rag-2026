@@ -13,6 +13,7 @@ from trecrag.clients.llm_client import AnthropicClient, IdentityLLMClient, LLMCl
 from trecrag.chunking import PassageSelector
 from trecrag.clients.pyserini_client import PyseriniClient
 from trecrag.config import get_env, require_env
+from trecrag.diagnostics import StageDiagnostics
 from trecrag.generation.generator import ExtractiveGenerator, Generator, LLMGenerator
 from trecrag.pipeline import GenerationSettings, RagPipeline, StageDepths
 from trecrag.rerank.colbert import ColBERTReranker, HashingTokenEncoder, TransformerTokenEncoder
@@ -158,7 +159,9 @@ def build_generator(generation_cfg: dict[str, Any], llm_cfg: dict[str, Any]) -> 
     return ExtractiveGenerator()
 
 
-def build_pipeline_from_config(config: dict[str, Any]) -> RagPipeline:
+def build_pipeline_from_config(
+    config: dict[str, Any], diagnostics: StageDiagnostics | None = None
+) -> RagPipeline:
     stages = config["stages"]
     bm25_cfg = stages.get("bm25", {})
     hybrid_cfg = stages.get("hybrid", {})
@@ -192,6 +195,7 @@ def build_pipeline_from_config(config: dict[str, Any]) -> RagPipeline:
         generation=generation,
         generator=build_generator(generation_cfg, llm_cfg),
         passage_selector=build_passage_selector(stages.get("passage_selection", {})),
+        diagnostics=diagnostics,
         biencoder=build_biencoder(stages.get("biencoder", {})),
         ltr=build_ltr(ltr_cfg),
         colbert=build_colbert(colbert_cfg),

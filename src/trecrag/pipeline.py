@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from trecrag.chunking import PassageSelector
+from trecrag.diagnostics import StageDiagnostics
 from trecrag.generation.generator import Generator
 from trecrag.rerank.base import Reranker
 from trecrag.retrieval.base import Retriever
@@ -52,7 +53,9 @@ class RagPipeline:
         cross_encoder: Reranker | None = None,
         llm_listwise: Reranker | None = None,
         passage_selector: PassageSelector | None = None,
+        diagnostics: StageDiagnostics | None = None,
     ):
+        self.diagnostics = diagnostics or StageDiagnostics(None)
         self.bm25 = bm25
         self.passage_selector = passage_selector
         self.biencoder = biencoder
@@ -81,29 +84,28 @@ class RagPipeline:
             if biencoder_candidates:
                 ranked_lists.append(biencoder_candidates)
 
-        candidates = reciprocal_rank_fusion(
+        self.diagnostics.record(topic.topic_id, "bm25", bm25_candidates, bm25_candidates)
+
+        fused = reciprocal_rank_fusion(
             ranked_lists, k_const=self.depths.rrf_k, top_k=self.depths.hybrid_top_k
         )
+        self.diagnostics.record(topic.topic_id, "rrf", bm25_candidates, fused)
+        candidates = fused
 
-        if self.ltr is not None:
-            candidates = self.ltr.rerank(topic, candidates, self.depths.ltr_top_k)
-        else:
-            candidates = candidates[: self.depths.ltr_top_k]
-
-        if self.colbert is not None:
-            candidates = self.colbert.rerank(topic, candidates, self.depths.colbert_top_k)
-        else:
-            candidates = candidates[: self.depths.colbert_top_k]
-
-        if self.cross_encoder is not None:
-            candidates = self.cross_encoder.rerank(topic, candidates, self.depths.ce_top_k)
-        else:
-            candidates = candidates[: self.depths.ce_top_k]
-
-        if self.llm_listwise is not None:
-            candidates = self.llm_listwise.rerank(topic, candidates, self.depths.llm_listwise_top_k)
-        else:
-            candidates = candidates[: self.depths.llm_listwise_top_k]
+        for name, reranker, depth in (
+            ("ltr", self.ltr, self.depths.ltr_top_k),
+            ("colbert", self.colbert, self.depths.colbert_top_k),
+            ("cross_encoder", self.cross_encoder, self.depths.ce_top_k),
+            ("llm_listwise", self.llm_listwise, self.depths.llm_listwise_top_k),
+        ):
+            before = candidates
+            if reranker is not None:
+                candidates = reranker.rerank(topic, candidates, depth)
+            else:
+                # A disabled stage still truncates to its configured depth, which
+                # is easy to forget and silently caps everything downstream.
+                candidates = candidates[:depth]
+            self.diagnostics.record(topic.topic_id, name, before, candidates)
 
         return candidates
 

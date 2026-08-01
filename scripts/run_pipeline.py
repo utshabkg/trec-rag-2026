@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from trecrag.config import load_dotenv_local, load_pipeline_config
 from trecrag.data.topics import load_topics
+from trecrag.diagnostics import StageDiagnostics
 from trecrag.factory import build_pipeline_from_config
 from trecrag.logging_utils import configure_logging, get_logger
 from trecrag.output.checkpoint import TopicCheckpointStore
@@ -57,7 +58,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Recompute every topic even if a checkpoint exists",
     )
-    parser.add_argument("--log-file", default=None, help="Tee logs to this file")
+    parser.add_argument("--log-file", default=None, help="Tee logs to this file "
+                        "(default: logs/<run-id>_<timestamp>.log)")
+    parser.add_argument("--log-dir", default="logs", help="Directory for run + stage logs")
+    parser.add_argument("--no-diagnostics", action="store_true",
+                        help="Skip per-stage diagnostics JSONL")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -67,7 +72,12 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    log_file = args.log_file or (out_dir / f"run_{args.run_id}.log")
+    # Logs live in the repo (logs/), not beside the submission artifacts, so a
+    # run's history survives deleting or re-creating an output directory.
+    log_dir = Path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime('%Y%m%d_%H%M%S')
+    log_file = args.log_file or (log_dir / f"{args.run_id}_{stamp}.log")
     configure_logging(args.log_level, log_file=log_file)
     load_dotenv_local()
 
@@ -76,6 +86,9 @@ def main() -> None:
     if args.limit is not None:
         topics = topics[: args.limit]
 
+    diagnostics = StageDiagnostics(
+        None if args.no_diagnostics else log_dir / f"stages_{args.run_id}_{stamp}.jsonl"
+    )
     store = TopicCheckpointStore(args.work_dir or (out_dir / "checkpoints"))
     pending = [t for t in topics if args.no_resume or not store.has(t.topic_id)]
     logger.info(
@@ -97,6 +110,7 @@ def main() -> None:
             logger.error("Topic %s FAILED (%s: %s)", topic.topic_id, type(exc).__name__, exc)
             return
         store.save(topic.topic_id, ranked, rag_answer)
+        diagnostics.flush()  # per topic, so a killed run keeps what it measured
         done += 1
         elapsed = time.time() - started
         rate = elapsed / max(done, 1)
@@ -107,7 +121,7 @@ def main() -> None:
         )
 
     if pending:
-        pipeline = build_pipeline_from_config(config)
+        pipeline = build_pipeline_from_config(config, diagnostics=diagnostics)
         if args.workers > 1:
             logger.warning(
                 "--workers %d: neural stages share one model instance per stage; "
