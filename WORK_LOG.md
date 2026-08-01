@@ -206,7 +206,49 @@ So this is neither a retrieval gap nor a prompting gap. Prompting for length has
 been tried twice and plateaued. **The fix is structural: one generation pass per
 sub-question, so length is emitted by construction rather than requested.**
 
-### 5.3 Grounding
+### 5.3 First-stage depth: 1000 is load-bearing, not padding
+
+Proposal raised (Debayan): cut BM25 depth 1000 → 500, on the grounds that
+downstream stages only consume a small top-k anyway. Measured over all 119
+baseline checkpoints, using the `bm25_rank` feature each candidate carries:
+
+| BM25 origin rank | share of submitted top-50 | share of generator top-10 |
+|---|---|---|
+| 1–100 | 26.3% | 30.3% |
+| 101–250 | 24.2% | 21.4% |
+| 251–500 | 23.8% | 23.8% |
+| **501–1000** | **25.7%** | **24.5%** |
+
+Cutting to 500 would discard **25.7% of submitted documents and 24.5% of the
+evidence the generator actually cites**, affecting **112 of 119 narratives**.
+
+The distribution is near-uniform, which is the real finding: **BM25 rank barely
+predicts final relevance.** Spearman correlation with the final submitted order
+is **+0.032 for BM25 rank** versus **+0.209 for the e5 biencoder** — the
+biencoder is ~6.5× the predictor BM25 is, and BM25's own ordering is close to
+noise with respect to the end result. This is consistent with §3.2: BM25 scores
+whole 66k-char documents, so its ranking is dominated by length and term
+frequency across irrelevant material.
+
+The biencoder is also demonstrably doing work, not producing "incremental gain":
+**BM25 and e5 agree on only 19% of their top-10**, so RRF is fusing two largely
+disjoint views rather than smoothing one.
+
+**Decision: keep depth 1000.** Under a sparse-only index the first-stage pool is
+the recall ceiling (§3.1), and a weak first-stage ranker is precisely the case
+where a wide pool matters most. Note also that BM25 depth does not affect run
+file size — the submitted run is 50 docs/narrative (375 KB) regardless.
+
+Costs of the change, for the record: 500 would halve API load and the response
+cache (4.9 GB → ~2.5 GB) and would dodge one instance of the §4.1 API bug
+(`rag2026-72` succeeds at 500). Changing `hits` also invalidates the entire cache
+and forces a re-fetch of all 119 narratives. Not worth 25% of the evidence.
+
+*Open question:* the flat distribution weakly suggests depth >1000 could still
+help. Untested — response size (~60 MB at 1000) and §4.1 exposure make it
+impractical to push much further.
+
+### 5.4 Grounding
 
 Of 1,135 checkable sentences: 309 verbatim-match a cited doc, 33 match an
 uncited-but-present doc, the rest are paraphrase. **The failure mode is
