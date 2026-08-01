@@ -425,6 +425,49 @@ uncached `hits=1000` searches whose 429 storm killed `train_ltr.py`.
 **Decision: do not train QDER.** The stage cannot help in this topology, and the
 model's score channel is inert in this configuration.
 
+### 5.6c Fixing the no-op: feature-level rank fusion
+
+The root cause behind both the QDER and LTR no-ops was structural, not a bug in
+either stage: **a cascade keeps only its last scorer's opinion.** Each stage
+re-sorted a pool that the next stage re-sorted from scratch, so an earlier
+stage's ordering was always discarded and only its *truncation* survived.
+
+Added `src/trecrag/rerank/fusion.py`: a weighted RRF over the per-stage scores
+already accumulated in `Candidate.features`, running after the cross-encoder.
+The cross-encoder now scores the pool without truncating (`top_k: 500`) and
+fusion selects the final 50, so no candidate is dropped before its earlier
+scores can count.
+
+**Fusion is by reciprocal rank, not by score.** Cross-encoder logits were all
+negative in a real run (max −1.84) while an untrained QDER's scale is arbitrary;
+min-max normalising them would let one stage's spread dominate for reasons
+unrelated to its accuracy. RRF needs only each signal's ordering, which is the
+part worth trusting.
+
+Verified on 5 topics, against the current CE-only ranking:
+
+| config | rankings differ |
+|---|---|
+| `qder_score: 0.0`, QDER enabled | 0/5 |
+| `qder_score: 0.0`, QDER disabled | 0/5 |
+| `qder_score: 0.5` | **5/5** |
+| `qder_score: 1.0` | **5/5** |
+
+Two things this establishes. A weight of 0 is **exactly** inert — the shipped
+config reproduces the validated cascade byte for byte, so this is safe to have
+in place before anything is trained. And a non-zero weight makes QDER genuinely
+live: it is now a dial, not a dead stage.
+
+**The weight ships at 0.0 deliberately.** The scorer is still untrained
+(`backend: hashing`, `model_path: null`), and giving noise a vote would degrade
+a validated cascade. What changed is that the question is now answerable by
+turning a dial rather than blocked by the topology — and that a trained QDER
+would be able to *contribute* rather than only prune (§5.6b finding 1).
+
+Caveat worth stating plainly: with no dev-set evaluation wired up, there is
+still no way to choose a non-zero weight on evidence. Fusion removes the
+structural blocker; it does not remove the measurement gap.
+
 ### 5.7 Grounding
 
 Of 1,135 checkable sentences: 309 verbatim-match a cited doc, 33 match an
@@ -528,14 +571,14 @@ Runtime: ~80 min with GPUs free; 512 min observed under Ollama contention.
       the ranking in this topology (its scores are discarded; it can only delete
       candidates ahead of a far stronger cross-encoder), and the model's BM25
       channel is mathematically inert with the entity channel off.
-- [ ] **Decide what QDER means for this submission.** Options, ranked:
-      (a) submit the cascade honestly without a QDER contribution and say so;
-      (b) make QDER's score *survive* — fuse `qder_score` into the final ordering
-          rather than letting the cross-encoder overwrite it — which is the only
-          change that makes a trained QDER able to help rather than only prune;
-      (c) source entity linking for ClimbMix so the "E" in QDER exists at all.
-- [ ] If (b): decide the fusion point and re-verify with the §5.6 enable/disable
-      check before investing in training.
+- [x] ~~Make QDER's score survive into the final ordering~~ — **done** (§5.6c).
+      Feature-level RRF fusion after the cross-encoder. Verified: weight 0 is
+      exactly inert, weight 0.5 changes 5/5 topics. QDER is now a dial.
+- [ ] **Choose a `qder_score` weight on evidence.** Ships at 0.0 because the
+      scorer is untrained and there is no dev signal to justify anything else.
+      Needs either a trained checkpoint or a dev-set metric — see below.
+- [ ] Consider entity linking for ClimbMix, which would both restore the "E" and
+      un-break the `doc_score` channel that LayerNorm currently erases (§5.6b).
 - [ ] Independent of QDER: `pip install pytrec-eval-terrier` in `trec-rag-2026`
       if any vendored trainer is ever run (absent in both envs today).
 
@@ -558,6 +601,11 @@ Runtime: ~80 min with GPUs free; 512 min observed under Ollama contention.
 Newest first. One line per substantive change, so the paper can reconstruct what
 was true when.
 
+- **Aug 1 — QDER branch.** Added feature-level rank fusion (§5.6c), removing the
+  structural reason QDER and LTR were no-ops: earlier stages' scores now survive
+  into the final ordering instead of being overwritten by the cross-encoder.
+  Ships with `qder_score` weight 0.0 (exactly inert, cascade unchanged) because
+  the scorer is untrained.
 - **Aug 1 — QDER branch.** Audited the training path: **NO-GO** (§5.6b). QDER's
   scores have no consumer, so training buys only the right to prune ahead of a
   stronger zero-shot cross-encoder; the model's BM25 channel is erased by a

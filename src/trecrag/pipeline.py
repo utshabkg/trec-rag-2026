@@ -36,6 +36,7 @@ class StageDepths:
     colbert_top_k: int = 100
     qder_top_k: int = 80
     ce_top_k: int = 50
+    fusion_top_k: int = 50
     llm_listwise_top_k: int = 20
     rrf_k: int = 60
 
@@ -59,6 +60,7 @@ class RagPipeline:
         colbert: Reranker | None = None,
         qder: Reranker | None = None,
         cross_encoder: Reranker | None = None,
+        fusion: Reranker | None = None,
         llm_listwise: Reranker | None = None,
         passage_selector: PassageSelector | None = None,
     ):
@@ -69,6 +71,7 @@ class RagPipeline:
         self.colbert = colbert
         self.qder = qder
         self.cross_encoder = cross_encoder
+        self.fusion = fusion
         self.llm_listwise = llm_listwise
         self.generator = generator
         self.depths = depths
@@ -116,6 +119,12 @@ class RagPipeline:
             candidates = self.cross_encoder.rerank(topic, candidates, self.depths.ce_top_k)
         else:
             candidates = candidates[: self.depths.ce_top_k]
+
+        # Fuse the signals the cascade already computed. Without this the
+        # cross-encoder's ordering is final and every earlier stage's score is
+        # discarded -- which is what made QDER and LTR no-ops.
+        if self.fusion is not None:
+            candidates = self.fusion.rerank(topic, candidates, self.depths.fusion_top_k)
 
         if self.llm_listwise is not None:
             candidates = self.llm_listwise.rerank(topic, candidates, self.depths.llm_listwise_top_k)

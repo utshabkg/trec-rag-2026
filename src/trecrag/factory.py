@@ -16,6 +16,7 @@ from trecrag.config import get_env, require_env
 from trecrag.generation.generator import ExtractiveGenerator, Generator, LLMGenerator
 from trecrag.pipeline import GenerationSettings, RagPipeline, StageDepths
 from trecrag.rerank.colbert import ColBERTReranker, HashingTokenEncoder, TransformerTokenEncoder
+from trecrag.rerank.fusion import FeatureFusionReranker
 from trecrag.rerank.cross_encoder import (
     CrossEncoderReranker,
     LexicalOverlapScorer,
@@ -195,6 +196,16 @@ def build_cross_encoder(ce_cfg: dict[str, Any]) -> CrossEncoderReranker | None:
     return CrossEncoderReranker(scorer)
 
 
+def build_fusion(fusion_cfg: dict[str, Any]) -> FeatureFusionReranker | None:
+    if not fusion_cfg.get("enabled", False):
+        return None
+    return FeatureFusionReranker(
+        feature_weights=fusion_cfg.get("feature_weights", {}),
+        k_rrf=int(fusion_cfg.get("k_rrf", 60)),
+        strict=bool(fusion_cfg.get("strict", True)),
+    )
+
+
 def build_llm_listwise(listwise_cfg: dict[str, Any], llm_cfg: dict[str, Any]) -> LLMListwiseReranker | None:
     if not listwise_cfg.get("enabled", True):
         return None
@@ -249,6 +260,7 @@ def build_pipeline_from_config(config: dict[str, Any]) -> RagPipeline:
     colbert_cfg = stages.get("colbert", {})
     qder_cfg = stages.get("qder", {})
     ce_cfg = stages.get("cross_encoder", {})
+    fusion_cfg = stages.get("fusion", {})
     listwise_cfg = stages.get("llm_listwise", {})
     generation_cfg = config["generation"]
     llm_cfg = config["llm"]
@@ -263,6 +275,7 @@ def build_pipeline_from_config(config: dict[str, Any]) -> RagPipeline:
         colbert_top_k=int(colbert_cfg.get("top_k", 100)),
         qder_top_k=int(qder_cfg.get("top_k", 80)),
         ce_top_k=int(ce_cfg.get("top_k", 50)),
+        fusion_top_k=int(fusion_cfg.get("top_k", 50)),
         llm_listwise_top_k=int(listwise_cfg.get("top_k", 20)),
     )
     generation = GenerationSettings(
@@ -285,5 +298,6 @@ def build_pipeline_from_config(config: dict[str, Any]) -> RagPipeline:
         colbert=build_colbert(colbert_cfg),
         qder=build_qder(qder_cfg),
         cross_encoder=build_cross_encoder(ce_cfg),
+        fusion=build_fusion(fusion_cfg),
         llm_listwise=build_llm_listwise(listwise_cfg, llm_cfg),
     )

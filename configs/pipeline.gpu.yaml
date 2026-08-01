@@ -113,7 +113,33 @@ stages:
     model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
     device: "cuda"
     batch_size: 64
+    # Score the whole pool but DO NOT truncate here: the fusion stage below is
+    # what selects the final 50. If the cross-encoder truncated, every earlier
+    # stage's score would be discarded for the documents it dropped, which is the
+    # behaviour that made QDER and LTR no-ops.
+    top_k: 500
+
+  fusion:
+    # Weighted RRF over scores the cascade already computed. Without this the
+    # cross-encoder's ordering is final, so QDER's score is written and then
+    # thrown away -- verified: rankings were byte-identical with QDER on or off.
+    #
+    # Fusion is by reciprocal RANK, not score: cross-encoder logits were all
+    # negative in a real run (max -1.84) while QDER's scale is arbitrary, so
+    # normalising scores would let one stage's spread dominate for reasons
+    # unrelated to accuracy. RRF only needs each signal's ordering.
+    #
+    # A weight of 0 disables a signal exactly. qder_score is 0 today because the
+    # scorer is UNTRAINED (backend: hashing, model_path: null) -- giving noise a
+    # vote would degrade a validated cascade. Raise it only alongside a trained
+    # checkpoint, and re-check with the enable/disable test in WORK_LOG.md 5.6.
+    enabled: true
+    k_rrf: 60
     top_k: 50                   # the set handed to listwise reranking + the R run
+    strict: true                # error if a weighted feature is absent, rather than fusing silently
+    feature_weights:
+      ce_score: 1.0
+      qder_score: 0.0
 
   llm_listwise:
     enabled: true
