@@ -370,6 +370,61 @@ really the brute-force cascade under a different `run_id`.
 `qder.enabled` true/false and compare `retrieve()` docid lists per topic. If they
 match, the stage is still inert.
 
+### 5.6b QDER training: NO-GO, and why
+
+Audited the training path before spending GPU time. Four findings, each verified
+independently rather than taken from the audit.
+
+**1. A trained checkpoint cannot improve the ranking — it can only delete.**
+`reranker.py:252,258` writes `qder_score` / `qder_hybrid_score` into
+`Candidate.features`, and `grep -rn "qder_score" src/ scripts/ configs/` finds
+**no consumer anywhere** (only `tests/test_qder.py:145`). QDER's output feeds
+straight into the cross-encoder, which scores every candidate it receives and
+re-sorts by its own score. So QDER's *ordering* is discarded; the only thing
+that survives is *which candidates it removed*. Training it buys the right to
+override `ms-marco-MiniLM-L-6-v2` — distilled from ~500k MS MARCO queries —
+with a model fit on 22 topics, and truncation is monotone: it can only lose
+recall. This is the same argument already written into the config for ColBERT
+(`pipeline.gpu.yaml:70-79`), minus the timing rationale.
+
+**2. The BM25 score channel is mathematically inert in our configuration.**
+`third_party/qder_training/qder_model.py:219-221` multiplies each pooled text
+feature by `doc_score`, and `:316` then applies `LayerNorm` over the
+concatenation. LayerNorm is scale-invariant, so a uniform scaling of everything
+it normalises is erased. Verified numerically:
+
+| | doc_score 0.5 | doc_score 7.0 |
+|---|---|---|
+| `use_entities: false` (our config) | max diff **4e-05** | **1e-05** |
+| `use_entities: true` | max diff 1.08 | 1.87 |
+
+With the entity channel off — which is our config, since there is no
+WAT/Wikipedia2Vec linker for ClimbMix — *every* concatenated feature is scaled
+by the same scalar, so `doc_score` contributes nothing. `prepare_qder_data.py`
+carefully min-max-normalises that field to match serve time; it is wasted work.
+Worse, `LayerNorm(0) == layer_norm.bias` exactly, so any candidate whose
+normalised `doc_score` is 0 (the weakest-BM25 candidate of every topic) produces
+a **constant, text-independent** vector — and backfilled positives are hard-coded
+to 0. Those rows teach a positive label on an input carrying no information.
+
+The finding is configuration-scoped: with entities enabled the scaling is
+relative and does matter. That is not a path available here.
+
+**3. The validation metric optimises the discarded quantity.**
+`third_party/qder_training/train.py:174` hard-codes `map`, and `train_qder.py`
+exposes no `--metric`. MAP scores QDER's ordering — thrown away by the
+cross-encoder. The only quantity the pipeline consumes is `recall@qder.top_k`.
+
+**4. It would have crashed anyway.** `pytrec_eval` is absent from *both* conda
+envs (verified), and `train_qder.py:175` uses `subprocess.run(..., check=True)`
+— so it raises **after** step 1 has already spent 22 fresh Pyserini searches.
+And **0 of the 22 dev topics are in the response cache** (verified by recomputing
+the cache keys: the cache holds exactly the 119 test topics). Those are the same
+uncached `hits=1000` searches whose 429 storm killed `train_ltr.py`.
+
+**Decision: do not train QDER.** The stage cannot help in this topology, and the
+model's score channel is inert in this configuration.
+
 ### 5.7 Grounding
 
 Of 1,135 checkable sentences: 309 verbatim-match a cited doc, 33 match an
@@ -469,16 +524,20 @@ Runtime: ~80 min with GPUs free; 512 min observed under Ollama contention.
 
 **QDER — current focus**
 
-- [ ] Train a QDER checkpoint (`scripts/train_qder.py`); none exists yet
-- [ ] Point the config at it: `backend: transformer`, `model_path: <ckpt>`
-- [ ] Set `qder.top_k` below the pool size so the stage actually prunes —
-      without this it cannot affect the output no matter how well it is trained
-      (§5.6). Steps 1 and 3 must land together: pruning on an untrained scorer
-      is worse than not pruning.
-- [ ] Re-run the enable/disable check in §5.6 and confirm the output now differs
-- [ ] Decide whether the entity channel can be fed at all. `use_entities: false`
-      today because there is no WAT/Wikipedia2Vec entity linking for ClimbMix
-      here, so QDER is running text-only — i.e. without the "E".
+- [x] ~~Train a QDER checkpoint~~ — **NO-GO**, see §5.6b. The stage cannot improve
+      the ranking in this topology (its scores are discarded; it can only delete
+      candidates ahead of a far stronger cross-encoder), and the model's BM25
+      channel is mathematically inert with the entity channel off.
+- [ ] **Decide what QDER means for this submission.** Options, ranked:
+      (a) submit the cascade honestly without a QDER contribution and say so;
+      (b) make QDER's score *survive* — fuse `qder_score` into the final ordering
+          rather than letting the cross-encoder overwrite it — which is the only
+          change that makes a trained QDER able to help rather than only prune;
+      (c) source entity linking for ClimbMix so the "E" in QDER exists at all.
+- [ ] If (b): decide the fusion point and re-verify with the §5.6 enable/disable
+      check before investing in training.
+- [ ] Independent of QDER: `pip install pytrec-eval-terrier` in `trec-rag-2026`
+      if any vendored trainer is ever run (absent in both envs today).
 
 **Carried over**
 
@@ -499,8 +558,13 @@ Runtime: ~80 min with GPUs free; 512 min observed under Ollama contention.
 Newest first. One line per substantive change, so the paper can reconstruct what
 was true when.
 
-- **Aug 1 — QDER branch.** Measured QDER to be a **no-op** in the shipped config
-  (§5.6). Restored the missing `output/checkpoint.py` that left
+- **Aug 1 — QDER branch.** Audited the training path: **NO-GO** (§5.6b). QDER's
+  scores have no consumer, so training buys only the right to prune ahead of a
+  stronger zero-shot cross-encoder; the model's BM25 channel is erased by a
+  LayerNorm whenever the entity channel is off; the trainer's metric optimises
+  the discarded ordering; and it would have crashed on a missing `pytrec_eval`
+  after spending 22 uncached Pyserini searches. Also measured QDER to be a
+  **no-op** in the shipped config (§5.6). Restored the missing `output/checkpoint.py` that left
   `run_pipeline.py` unimportable on this branch, and anchored the `.gitignore`
   rule that had made that module untrackable. Fixed a 429 `RetryError` escaping
   the retry loop and killing `train_ltr.py` mid-run. Trained
