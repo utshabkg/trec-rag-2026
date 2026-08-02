@@ -73,6 +73,37 @@ and everything newer, not just Gemma 4. It needs root and affects every user on
 the box, so it is a team decision — but it is currently pinning us to a vLLM
 release from before Gemma 4 existed.
 
+### Would upgrading break the models that currently work?
+
+**No.** Checked against NVIDIA's own compatibility documentation rather than
+assumed, because this is a shared machine:
+
+1. **Driver API is backward compatible.** Per NVIDIA's CUDA Compatibility guide,
+   "new NVIDIA drivers will always work with applications compiled with an older
+   CUDA toolkit." Our `torch 2.11.0+cu128` and `torch 2.9.0+cu128` builds keep
+   running unchanged — no rebuild, no reinstall, no env changes.
+2. **Our GPUs survive the CUDA 13 cut.** CUDA 13 dropped Maxwell, Pascal and
+   Volta. These cards are **RTX 6000 Ada, compute capability sm_89** (confirmed
+   via `nvidia-smi --query-gpu=compute_cap`), which is Ada Lovelace — well inside
+   the still-supported Turing-and-newer range.
+
+So the upgrade is **additive**: Qwen 7B and Qwen 72B AWQ keep working exactly as
+they do now, and vLLM ≥ 0.20 plus Gemma 4 become available. Ollama also continues
+to work, for the same backward-compatibility reason.
+
+Incidental detail worth knowing: our torch build advertises
+`['sm_75','sm_80','sm_86','sm_90','sm_100','sm_120']` — **sm_89 is not listed**.
+It runs anyway because CUDA binaries are forward-compatible across minor
+revisions within a major version, so the sm_86 cubins execute on sm_89 hardware.
+Not a problem, but it explains why the arch list looks like it is missing our
+card.
+
+**The real costs are operational, not compatibility:** the upgrade needs root and
+a driver reload (usually a reboot), which kills every running GPU job on the box —
+so it has to be coordinated with whoever is mid-run. And any driver upgrade on a
+research machine carries some regression risk. The vLLM 0.26 env would need
+recreating (~10 minutes); it was removed after being proven unusable here.
+
 ### Meanwhile: use Ollama for Gemma 4
 
 Ollama runs `gemma4:31b` today — it bundles a driver-compatible CUDA runtime.
