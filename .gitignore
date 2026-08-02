@@ -234,3 +234,7 @@ __marimo__/
 *.jsonl.tmp
 
 logs/
+
+# Clone of the official TREC-RAG data repo (its own git repo, 1.7GB).
+# git add -A would otherwise record it as a broken gitlink/submodule.
+trec-rag-data/
