@@ -302,7 +302,64 @@ Net: the two stages that were removed or narrowed are the ones that could not be
 shown to contribute; the one kept wide is the one measurement says is doing the
 work.
 
-### 5.5 Grounding
+### 5.5 First measured results on the development set
+
+`scripts/eval/` now scores runs against the RAG25 dev qrels (22 narratives, three
+projected-UMBRELA assessor variants). Everything before this section was decided
+by inspection; everything after can be decided by measurement.
+
+**Baseline, current cascade:**
+
+| assessor | nDCG@10 | nDCG@20 | nDCG@100 |
+|---|---|---|---|
+| codex-gpt5.5 | 0.4170 | 0.3776 | 0.2160 |
+| ministral-3-14b | 0.4915 | 0.4536 | 0.2537 |
+| qwen3.5-9b | 0.4356 | 0.4121 | 0.2403 |
+
+Per-topic nDCG@10 ranges 0.14–1.00 (stdev 0.198), so topic difficulty dominates
+the raw spread.
+
+**Statistical note — one to get right.** An early reading of this data used the
+*unpaired* standard error (0.198/√22 ≈ 0.042, implying ~0.084 detectable) and
+concluded the dev set could only catch large effects. That is the wrong test for
+this design: every arm is scored on the *same* topics, so topic difficulty
+cancels and the correct quantity is the standard error of the **per-topic
+differences**, measured at **0.014–0.023**. The real detectable threshold is
+therefore ≈0.04 nDCG@10, roughly twice as sensitive as first stated.
+
+**Three-arm listwise experiment** (identical except the listwise stage), paired
+per topic:
+
+| comparison | codex | ministral | qwen | verdict |
+|---|---|---|---|---|
+| top-20 vs all-50 | −0.005 (t=−0.33) | −0.004 (t=−0.25) | +0.001 (t=+0.05) | **no effect** |
+| listwise vs none | +0.027 (t=+1.54) | +0.021 (t=+0.93) | +0.013 (t=+0.61) | positive, not significant |
+
+Runtime over the 22 topics: all-50 **28.0 min**, top-20 **19.2 min**, none
+**16.0 min**.
+
+Two conclusions:
+
+1. **Narrowing listwise to `rerank_depth: 20` is free.** t-values near zero on
+   all three assessors, sign flips between them. The 4-calls-to-1 change bought
+   ~31% wall clock at no measurable cost. This was previously a cost argument
+   with no evidence; it now has evidence.
+2. **Keep listwise; do not remove it.** Every assessor puts it ahead of no
+   listwise (+0.013 to +0.027, 40 wins / 26 losses pooled, sign test p=0.109 —
+   indicative, not significant, and the three assessors are not independent).
+   Crucially it now costs only **~3 min over 22 topics (~9 s/topic)** at
+   `rerank_depth: 20`, not the ~85% of runtime it consumed at all-50. A cheap
+   stage with a consistently positive sign is worth keeping even when the effect
+   cannot be resolved at n=22.
+
+**Caveat on recall metrics.** ~900 documents/topic are graded ≥2 in these
+projected qrels (76% of everything judged), so R@100 is capped near 0.14 and MAP
+near 0.02 regardless of system quality. `R@100 == R@1000` in every arm because we
+submit 50 documents. Compare systems on nDCG@10/@20; treat the recall column as
+diagnostic only, and note that a grade≥3 cut (~213 docs/topic) would be the more
+discriminating threshold if recall becomes the question.
+
+### 5.6 Grounding
 
 Of 1,135 checkable sentences: 309 verbatim-match a cited doc, 33 match an
 uncited-but-present doc, the rest are paraphrase. **The failure mode is
