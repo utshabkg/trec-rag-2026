@@ -124,6 +124,16 @@ def main() -> None:
     parser.add_argument("--rel-threshold", type=int, default=DEFAULT_REL_THRESHOLD,
                         help="minimum UMBRELA grade counted as relevant for recall/MAP")
     parser.add_argument("--per-topic", action="store_true", help="also print per-topic nDCG@10")
+    parser.add_argument(
+        "--condensed", action="store_true",
+        help="drop unjudged documents before scoring (Sakai's condensed lists). Use this "
+             "whenever comparing a reranker against the system the judgment pool was built "
+             "from -- otherwise the reranker is penalised for surfacing unjudged documents.",
+    )
+    parser.add_argument(
+        "--judged-rate", action="store_true",
+        help="report what fraction of each run's top-k was actually judged",
+    )
     args = parser.parse_args()
 
     qrels_files = sorted(Path(args.qrels_dir).glob("*.qrels"))
@@ -158,7 +168,25 @@ def main() -> None:
                 print(f"{name[:42]:42s}  NO OVERLAP with judged topics "
                       f"(run has {len(run)} topics, e.g. {sorted(run)[:2]})")
                 continue
-            scores, per_topic = evaluate({t: run[t] for t in overlap}, graded, binary)
+            scoped = {t: run[t] for t in overlap}
+            if args.judged_rate:
+                rates = []
+                for topic, docs in scoped.items():
+                    top = sorted(docs.items(), key=lambda kv: -kv[1])[:10]
+                    if top:
+                        rates.append(sum(1 for d, _ in top if d in graded[topic]) / len(top))
+                print(f"{name[:42]:42s}  judged@10 = {statistics.mean(rates):.1%}")
+            if args.condensed:
+                # Unjudged documents score 0, so a reranker that promotes documents
+                # the pool never saw is punished for the pool's shape rather than
+                # its own ranking. Removing them compares systems only on documents
+                # the assessors actually looked at.
+                scoped = {
+                    t: {d: s for d, s in docs.items() if d in graded.get(t, {})}
+                    for t, docs in scoped.items()
+                }
+                scoped = {t: d for t, d in scoped.items() if d}
+            scores, per_topic = evaluate(scoped, graded, binary)
             row = f"{name[:42]:42s} " + " ".join(f"{scores.get(m, 0.0):10.4f}" for m in DISPLAY)
             if len(overlap) < len(judged_topics):
                 row += f"   [{len(overlap)}/{len(judged_topics)} topics]"
