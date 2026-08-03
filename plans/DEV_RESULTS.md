@@ -55,7 +55,11 @@ nDCG@10 = 1.0000, shuffled 0.5668, reverse-ranked 0.0030.
   ranking quality. *(§4.2)*
 - **H3** — The LLM listwise stage contributes at all. *(§4.3)*
 - **H4** — LTR contributes. *(§4.1)*
-- **H5** — Added stages cost latency; is the tradeoff favourable? *(§5)*
+- **H5** — Added stages cost latency, but buy quality; is the tradeoff
+  favourable, and where are the marginal returns? *(§5)* — motivated in §5.0:
+  quality figures alone cannot distinguish a stage that buys +0.02 nDCG for 0.5 s
+  from one that buys +0.02 for 30 s, and the notebook paper needs that
+  distinction.
 
 ---
 
@@ -150,36 +154,105 @@ rather than the ~32 s it cost at all-50.
 
 ---
 
-## 5. H5: latency
+## 5. H5: latency, and the cost/quality tradeoff
 
-Per-narrative, single process, serial:
+### 5.0 Why we measure this
 
-| stage | s/narrative | share |
+A cascade is a sequence of increasingly expensive stages, and the honest question
+about any of them is not "does it help?" but "does it help *enough to be worth
+its cost?*". Reporting quality alone hides that: a stage that buys +0.02 nDCG@10
+for 0.5 s and a stage that buys +0.02 for 30 s are very different engineering
+propositions, and a reader cannot tell them apart from a quality table.
+
+So latency is instrumented per stage on the *same runs* as the quality metrics,
+which lets us state the tradeoff directly and, for the notebook paper, plot
+quality against cost as stages are added. It also makes the system reproducible
+in a way a quality number alone is not — the same code on different hardware, or
+with a cold cache, is a materially different system.
+
+Measured on: **2× NVIDIA RTX 6000 Ada (49 GB each, driver 575.57.08), Intel Xeon
+w9-3595X (120 logical cores), 754 GB RAM, Linux 6.1.0-47.** Single process, one
+narrative at a time (`--workers 1`) — the neural stages share one model instance
+each, so these are serial per-narrative latencies, not a throughput-tuned
+deployment.
+
+### 5.1 Phase A — preprocessing (query decomposition)
+
+| step | s/narrative | notes |
 |---|---|---|
-| generation (LLM) | 34.10 | **67.4%** |
-| llm_listwise (LLM) | 9.89 | 19.5% |
-| biencoder (GPU) | 4.96 | 9.8% |
-| passage_selection (CPU) | 0.96 | 1.9% |
-| cross_encoder (GPU) | 0.45 | 0.9% |
-| bm25 (network) | 0.23 cached / **4.23 cold** | 0.5% |
-| **total** | **50.59** | ≈71 narratives/hour |
+| Step 1: decomposition | **0.92** | 119 narratives in 1 m 49 s, batched vLLM (Qwen2.5-72B-AWQ, tp=2) |
+| Step 2: per-sub-question retrieval | *not built* | planned |
+| Step 3: per-facet generation | *not built* | planned |
+| **Phase A total (current)** | **0.92** | + ~4.7 min one-time model load, amortised over the run |
 
-Quality/latency tradeoff, retrieval arms only:
+**The most actionable number in this document.** Decomposition costs 0.92 s per
+narrative under *batched* vLLM, against 34 s for a single *serial* Ollama
+generation call — a ~37× difference in per-narrative cost for comparable LLM
+work. The gap is batching, not model size: vLLM sustained 793 input tok/s and
+150 output tok/s across a 119-prompt batch. Steps 2 and 3 should therefore be
+built on batched vLLM rather than per-narrative calls, or they will dominate
+total runtime unnecessarily.
 
-| arm | s/narrative | condensed nDCG@10 (ministral) |
+### 5.2 Phase B — retrieval pipeline
+
+| stage | kind | s/narrative | share of Phase B |
+|---|---|---|---|
+| bm25 | network (Pyserini) | 0.23 cached / **4.23 cold** | 1.4% |
+| passage_selection | CPU | 0.96 | 5.8% |
+| biencoder (e5) | GPU | 4.96 | 30.1% |
+| rrf | CPU | ~0.00 | 0.0% |
+| cross_encoder | GPU | 0.45 | 2.7% |
+| llm_listwise | LLM (Ollama) | 9.89 | 60.0% |
+| **Phase B total** | | **16.49** | 100% |
+
+**The Pyserini API is not the bottleneck** — 4.23 s cold against 9.89 s for
+listwise reranking and 34 s for generation. Worth stating explicitly because it
+is the intuitive suspect for a system built on a remote index.
+
+### 5.3 Phase C — answer generation
+
+| stage | kind | s/narrative | share |
+|---|---|---|---|
+| generation | LLM (Ollama, serial) | **34.10** | 100% |
+
+### 5.4 End to end
+
+| phase | s/narrative | share of total |
 |---|---|---|
-| BM25 | ~1 | 0.6840 |
-| + e5/RRF | ~7 | 0.7336 |
-| + cross-encoder | ~8 | 0.7938 |
-| + listwise | ~17 | 0.8136 |
+| A — preprocessing | 0.92 | 1.8% |
+| B — retrieval pipeline | 16.49 | 32.0% |
+| C — generation | 34.10 | **66.2%** |
+| **total** | **51.51** | ≈70 narratives/hour |
 
-Monotonic in both, with clear diminishing returns past the cross-encoder.
+≈100 min for the 119-narrative test set cached; ≈108 min with live retrieval.
 
-Two notes for any published figure: the `bm25` row is a **cached disk read**
-(0.23 s) not live API latency (4.23 s, measured) — an ~18× difference for
-identical code; and the **Pyserini API is not the bottleneck** at this scale
-(4.23 s against 34 s of generation), which is worth stating because it is the
-intuitive suspect.
+### 5.5 The tradeoff (H5)
+
+Quality against cost as retrieval stages are added:
+
+| arm | cumulative s/narrative | condensed nDCG@10 (ministral) | Δ nDCG per added second |
+|---|---|---|---|
+| BM25 | ~1.2 | 0.6840 | — |
+| + e5/RRF | ~6.2 | 0.7336 | +0.0099 |
+| + cross-encoder | ~6.6 | 0.7938 | **+0.1505** |
+| + listwise | ~16.5 | 0.8136 | +0.0020 |
+
+**Monotonic in both quality and cost — the tradeoff is favourable overall, so H5
+is supported.** But the marginal returns differ by two orders of magnitude: the
+cross-encoder is by far the best value (+0.060 nDCG for 0.45 s), while listwise
+buys +0.020 for 9.89 s. Both are kept, for different reasons — the cross-encoder
+because it is nearly free, listwise because it is consistently positive and the
+budget currently allows it.
+
+### 5.6 Caveats for any published latency figure
+
+- The `bm25` row is a **cached local disk read** (0.23 s), not live API latency
+  (**4.23 s**, measured against the real service) — an ~18× difference for
+  identical code. Any table must say which condition it describes.
+- Serial, single-narrative measurement. A batched or concurrent deployment would
+  look very different, as §5.1 shows.
+- Phase A covers only step 1; steps 2 and 3 are not built, so the current total
+  is not the projected final system's cost.
 
 ---
 
