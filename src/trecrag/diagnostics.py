@@ -92,6 +92,7 @@ class StageDiagnostics:
         stage: str,
         before: list[Candidate],
         after: list[Candidate],
+        elapsed_s: float | None = None,
     ) -> None:
         if not self.enabled:
             return
@@ -99,6 +100,7 @@ class StageDiagnostics:
             {
                 "topic_id": topic_id,
                 "stage": stage,
+                "elapsed_s": round(elapsed_s, 4) if elapsed_s is not None else None,
                 "n_in": len(before),
                 "n_out": len(after),
                 "with_text_in": sum(1 for c in before if c.text),
