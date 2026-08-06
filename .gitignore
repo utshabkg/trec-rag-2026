@@ -231,6 +231,10 @@ __marimo__/
 # checkpoints, which are build products, not source.
 /output/
 /output_*/
+!/output_decomp/
+/output_decomp/*
+!/output_decomp/preprocessed_queries*.jsonl
+/output_decomp/preprocessed_queries*_flagged.jsonl
 *.jsonl.tmp
 
 logs/
