@@ -15,6 +15,12 @@ from trecrag.clients.pyserini_client import PyseriniClient
 from trecrag.config import get_env, require_env
 from trecrag.diagnostics import StageDiagnostics
 from trecrag.generation.generator import ExtractiveGenerator, Generator, LLMGenerator
+from trecrag.generation.verifier import (
+    AnswerVerifier,
+    CompositeVerifier,
+    LexicalGroundingVerifier,
+    LLMVerifier,
+)
 from trecrag.pipeline import GenerationSettings, RagPipeline, StageDepths
 from trecrag.rerank.colbert import ColBERTReranker, HashingTokenEncoder, TransformerTokenEncoder
 from trecrag.rerank.cross_encoder import (
@@ -153,10 +159,80 @@ def build_llm_listwise(listwise_cfg: dict[str, Any], llm_cfg: dict[str, Any]) ->
     )
 
 
+def build_verifier(
+    verification_cfg: dict[str, Any], llm_cfg: dict[str, Any]
+) -> AnswerVerifier | None:
+    """Build the answer verifier, or `None` when it is switched off.
+
+    Off by default: verification adds a regeneration on the stage that is
+    already 67% of runtime, so enabling it is a budget decision the config has
+    to make explicitly rather than something a code default imposes on the
+    banked submission path.
+    """
+    if not verification_cfg.get("enabled", False):
+        return None
+
+    verifiers: list[AnswerVerifier] = []
+    backends = verification_cfg.get("backends", ["lexical"])
+    if isinstance(backends, str):
+        backends = [backends]
+
+    for backend in backends:
+        if backend == "lexical":
+            verifiers.append(
+                LexicalGroundingVerifier(
+                    min_overlap=float(verification_cfg.get("min_overlap", 0.25)),
+                    max_ungrounded_ratio=float(
+                        verification_cfg.get("max_ungrounded_ratio", 0.34)
+                    ),
+                    min_evidence_used=float(verification_cfg.get("min_evidence_used", 0.5)),
+                    check_hallucination=bool(
+                        verification_cfg.get("check_hallucination", True)
+                    ),
+                    check_omission=bool(verification_cfg.get("check_omission", True)),
+                )
+            )
+        elif backend == "llm":
+            verifiers.append(
+                LLMVerifier(
+                    build_llm_client(
+                        verification_cfg.get("llm_backend", "openai"),
+                        llm_cfg,
+                        model_env_override=verification_cfg.get("model_env"),
+                    ),
+                    thinking=bool(verification_cfg.get("thinking", False)),
+                    max_tokens=verification_cfg.get("max_tokens"),
+                    max_consecutive_unparsable=int(
+                        verification_cfg.get("max_consecutive_unparsable", 3)
+                    ),
+                    strict=bool(verification_cfg.get("strict", False)),
+                )
+            )
+        else:
+            raise ValueError(f"unknown verification backend {backend!r}")
+
+    if not verifiers:
+        return None
+    # Cheapest first, and short-circuiting, so a draft the free check already
+    # rejects never pays for the LLM judge.
+    return verifiers[0] if len(verifiers) == 1 else CompositeVerifier(verifiers)
+
+
 def build_generator(generation_cfg: dict[str, Any], llm_cfg: dict[str, Any]) -> Generator:
     if generation_cfg.get("backend", "extractive") == "llm":
         llm = build_llm_client(generation_cfg.get("llm_backend", "openai"), llm_cfg)
-        return LLMGenerator(llm)
+        verification_cfg = generation_cfg.get("verification", {})
+        verifier = build_verifier(verification_cfg, llm_cfg)
+        return LLMGenerator(
+            llm,
+            thinking=bool(generation_cfg.get("thinking", False)),
+            verifier=verifier,
+            # One retry only when verification is on: the second draft is the
+            # one carrying the verifier's instructions, and a third rarely
+            # differs enough to be worth another full generation.
+            max_attempts=int(verification_cfg.get("max_attempts", 2)) if verifier else 1,
+            max_tokens=generation_cfg.get("max_tokens"),
+        )
     return ExtractiveGenerator()
 
 
