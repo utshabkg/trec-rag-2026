@@ -19,18 +19,30 @@ from trecrag.logging_utils import get_logger
 logger = get_logger("llm_client")
 
 _THINK_BLOCK_RE = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.DOTALL | re.IGNORECASE)
+_UNCLOSED_THINK_RE = re.compile(r"<(think|thinking|reasoning)>.*\Z", re.DOTALL | re.IGNORECASE)
 
 
 def strip_reasoning(text: str) -> str:
-    """Remove chain-of-thought blocks that reasoning models emit inline.
+    """Remove chain-of-thought blocks that models emit inline.
 
     Both downstream parsers are positional: the listwise reranker takes every
     integer in the response as a rank permutation, and the generator takes the
     first bracketed span as its JSON answer. Reasoning text contains plenty of
     both, so leaving it in silently corrupts rankings and answers rather than
     failing loudly.
+
+    An *unterminated* block is stripped to the end of the string as well. A
+    block cut off by the token budget keeps no closing tag, so matching only
+    balanced pairs would leave the whole reasoning trace in place — the very
+    corruption this exists to prevent, and the likeliest failure now that the
+    generator prompt asks for a think block on purpose. Everything after an
+    unclosed opening tag is reasoning by definition, so dropping it either
+    leaves the answer intact (tag came after it) or yields an empty string,
+    which the callers already treat as "unparsable" and fall back on.
     """
-    return _THINK_BLOCK_RE.sub("", text).strip()
+    text = _THINK_BLOCK_RE.sub("", text)
+    text = _UNCLOSED_THINK_RE.sub("", text)
+    return text.strip()
 
 
 class LLMClient(ABC):
