@@ -13,6 +13,8 @@ from trecrag.clients.llm_client import AnthropicClient, IdentityLLMClient, LLMCl
 from trecrag.chunking import PassageSelector
 from trecrag.clients.pyserini_client import PyseriniClient
 from trecrag.config import get_env, require_env
+from trecrag.decomposed.loader import load_decomposed_topics
+from trecrag.decomposed.orchestrator import DecomposedPipeline, FanoutSettings
 from trecrag.diagnostics import StageDiagnostics
 from trecrag.generation.generator import ExtractiveGenerator, Generator, LLMGenerator
 from trecrag.generation.verifier import (
@@ -278,4 +280,122 @@ def build_pipeline_from_config(
         colbert=build_colbert(colbert_cfg),
         cross_encoder=build_cross_encoder(ce_cfg),
         llm_listwise=build_llm_listwise(listwise_cfg, llm_cfg),
+    )
+
+
+def build_decomposed_pipeline_from_config(
+    config: dict[str, Any],
+    diagnostics: StageDiagnostics | None = None,
+    per_ain_diagnostics: bool = False,
+) -> DecomposedPipeline:
+    """Assemble the per-AIN fan-out pipeline from a config carrying `decomposition:`.
+
+    The two cascades (per-need and composite) are constructed over *shared*
+    component instances. Calling `build_pipeline_from_config` twice would load a
+    second copy of e5 and the cross-encoder onto the GPU for no benefit.
+    """
+    stages = config["stages"]
+    decomp_cfg = config["decomposition"]
+    ltr_cfg = stages.get("ltr", {})
+    colbert_cfg = stages.get("colbert", {})
+    ce_cfg = stages.get("cross_encoder", {})
+    listwise_cfg = stages.get("llm_listwise", {})
+    llm_cfg = config["llm"]
+    generation_cfg = config["generation"]
+
+    per_ain_cfg = decomp_cfg.get("per_ain", {})
+    fusion_cfg = decomp_cfg.get("fusion", {})
+
+    # Built once, shared by both cascades.
+    bm25 = BM25Retriever(build_pyserini_client(config))
+    passage_selector = build_passage_selector(stages.get("passage_selection", {}))
+    biencoder = build_biencoder(stages.get("biencoder", {}))
+    ltr = build_ltr(ltr_cfg)
+    colbert = build_colbert(colbert_cfg)
+    cross_encoder = build_cross_encoder(ce_cfg)
+
+    # Per-need diagnostics are ~6 records per need, ~10.7 needs per narrative.
+    # Off by default: the aggregate `ain_fanout` record is what makes this arm
+    # interpretable, and the detail buries it ~64:1.
+    ain_diagnostics = diagnostics if per_ain_diagnostics else StageDiagnostics(None)
+
+    def _cascade(bm25_hits: int, ce_top_k: int, stage_diagnostics: StageDiagnostics | None) -> RagPipeline:
+        # Every depth below the pool size would truncate. A disabled stage still
+        # applies its depth (`pipeline.py`'s `candidates[:depth]`), so the
+        # inactive stages are pinned at the pool size to cut nothing, and the
+        # listwise depth is pinned too because listwise is deliberately absent
+        # here and would otherwise silently cap the run at its configured 50.
+        depths = StageDepths(
+            bm25_hits=bm25_hits,
+            hybrid_top_k=min(int(stages.get("hybrid", {}).get("top_k", 500)), bm25_hits),
+            rrf_k=int(stages.get("hybrid", {}).get("rrf_k", 60)),
+            ltr_top_k=bm25_hits,
+            colbert_top_k=bm25_hits,
+            ce_top_k=ce_top_k,
+            llm_listwise_top_k=ce_top_k,
+        )
+        return RagPipeline(
+            bm25=bm25,
+            depths=depths,
+            generation=GenerationSettings(),  # unused: generation runs on the pool
+            generator=ExtractiveGenerator(),  # ditto; never invoked by `retrieve`
+            passage_selector=passage_selector,
+            diagnostics=stage_diagnostics,
+            biencoder=biencoder,
+            ltr=ltr,
+            colbert=colbert,
+            cross_encoder=cross_encoder,
+            llm_listwise=None,  # runs once on the pooled list instead
+        )
+
+    per_ain_hits = int(per_ain_cfg.get("bm25_hits", 100))
+    ain_cascade = _cascade(
+        bm25_hits=per_ain_hits,
+        ce_top_k=min(int(ce_cfg.get("top_k", 50)), per_ain_hits),
+        stage_diagnostics=ain_diagnostics,
+    )
+
+    composite_cascade = None
+    include_composite = bool(decomp_cfg.get("include_composite_run", True))
+    if include_composite:
+        composite_cascade = _cascade(
+            bm25_hits=int(stages.get("bm25", {}).get("hits", 1000)),
+            ce_top_k=int(ce_cfg.get("top_k", 50)),
+            stage_diagnostics=ain_diagnostics,
+        )
+
+    decomp_generation_cfg = decomp_cfg.get("generation", {})
+    settings = FanoutSettings(
+        query_variant=decomp_cfg.get("query_variant", "step3b_expanded_query"),
+        per_ain_top_k=int(per_ain_cfg.get("top_k", 5)),
+        fusion_rrf_k=int(fusion_cfg.get("rrf_k", 60)),
+        fusion_top_k=int(fusion_cfg.get("top_k", 100)),
+        composite_weight=float(fusion_cfg.get("composite_weight", 1.0)),
+        include_composite_run=include_composite,
+        max_ains=decomp_cfg.get("max_ains"),
+        final_top_k=int(config["retrieval_output"]["depth"]),
+        coverage_aware_evidence=bool(
+            decomp_generation_cfg.get("coverage_aware_evidence", True)
+        ),
+        evidence_per_sub_question=int(
+            decomp_generation_cfg.get("evidence_per_sub_question", 1)
+        ),
+        include_sub_questions_in_prompt=bool(
+            decomp_generation_cfg.get("include_sub_questions_in_prompt", True)
+        ),
+    )
+
+    return DecomposedPipeline(
+        ain_cascade=ain_cascade,
+        composite_cascade=composite_cascade,
+        llm_listwise=build_llm_listwise(listwise_cfg, llm_cfg),
+        generator=build_generator(generation_cfg, llm_cfg),
+        decomposed=load_decomposed_topics(decomp_cfg["path"]),
+        settings=settings,
+        generation=GenerationSettings(
+            evidence_k=int(generation_cfg.get("evidence_k", 10)),
+            max_words=int(generation_cfg.get("max_words", 1024)),
+            max_citations_per_sentence=int(generation_cfg.get("max_citations_per_sentence", 3)),
+        ),
+        diagnostics=diagnostics,
     )
