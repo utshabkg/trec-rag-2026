@@ -145,12 +145,29 @@ def main() -> None:
     if not qrels_files:
         raise SystemExit(f"no qrels found (looked in {args.qrels_dir})")
 
-    runs = {}
-    for spec in args.runs:
-        path = Path(spec)
+    # Label runs by basename, but ONLY while that is unambiguous. Every run this
+    # project produces is written as `r_output_trec_rag_2026.tsv` inside a
+    # per-experiment directory, so keying the table on the basename alone made the
+    # second run silently overwrite the first: one row printed, one run scored
+    # twice, no warning, and a comparison that looked entirely normal. Fall back to
+    # `<parent>/<name>` for any basename that appears more than once, and refuse
+    # outright if that is still not unique rather than dropping a run.
+    paths = [Path(spec) for spec in args.runs]
+    for path in paths:
         if not path.is_file():
             raise SystemExit(f"run file not found: {path}")
-        runs[path.name] = load_run(path)
+    basenames = [path.name for path in paths]
+    labels = [
+        path.name if basenames.count(path.name) == 1 else f"{path.parent.name}/{path.name}"
+        for path in paths
+    ]
+    if len(set(labels)) != len(labels):
+        duplicated = sorted({label for label in labels if labels.count(label) > 1})
+        raise SystemExit(
+            f"run labels are not unique after disambiguation: {duplicated}. "
+            f"Rename or copy the run files so each has a distinct name."
+        )
+    runs = {label: load_run(path) for label, path in zip(labels, paths)}
 
     for qrels_path in qrels_files:
         graded, binary = load_qrels(qrels_path, args.rel_threshold)
