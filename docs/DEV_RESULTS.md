@@ -43,16 +43,41 @@ Decomposition should help most on narratives that ask many things. It doesn't:
 Split by narrative width, averaged over assessors: **1–2 sub-q −0.003 · 3–4 sub-q
 +0.001 · 5+ sub-q −0.002**. There is no subset where it pays.
 
-## Most likely cause
+## Suspected cause — tested, and ruled out
 
-The deeper-cutoff shortfall points at the assumption flagged as untested in
+The deeper-cutoff shortfall pointed at the assumption flagged as untested in
 `configs/pipeline.decomposed.yaml`: `per_ain.bm25_hits: 100` against the composite's
-1000, and a fusion pool of 100 against the composite's RRF-500. The decomposed arm
-builds its deep ranks from a much shallower pool, which is exactly where it loses.
-The config comment says "raise this first if recall looks thin" — recall looks thin.
+1000. The arm builds its deep ranks from a much shallower pool, which is exactly
+where it loses, and the config says "raise this first if recall looks thin".
 
-Testing `bm25_hits: 1000` on dev is ~1 h and ~10 GB of cache. It cannot reach this
-submission: applying it to the 119 test topics is another ~6 h and ~80 GB.
+**Raised it to 1000 and it got worse, not better** (`pipeline.decomposed.hits1000.yaml`,
+one substantive line different; it also lifts the per-need RRF pool 100 -> 500 via
+`hybrid_top_k = min(500, bm25_hits)`). Dev run: 22 topics, 60 min, 146/146 needs
+retrieved, so the arm ran at full strength.
+
+| metric | Δ vs hits=100 (3 assessors) | Δ vs composite |
+|---|---|---|
+| nDCG@10 | −0.029 −0.020 −0.018 | −0.017 −0.023 −0.031 |
+| nDCG@20 | −0.050 −0.061 −0.056 | −0.057 −0.067 −0.067 |
+| nDCG@100 | −0.026 −0.032 −0.030 | −0.034 −0.045 −0.041 |
+| R@100 | −0.004 −0.004 −0.004 | −0.005 −0.006 −0.005 |
+| MAP | −0.003 −0.004 −0.003 | −0.005 −0.006 −0.005 |
+
+**Worse in 15/15 (assessor x metric) cells against both baselines**, and the nDCG@20
+loss exceeds the ~0.04 detection threshold — a real degradation, not noise. So the
+shallow per-need pool is NOT the explanation for the deep-cutoff shortfall; feeding
+the cross-encoder 10x more candidates per need makes it promote worse documents,
+which is the wrong-aspect failure mode this project already documents.
+
+One caveat on how far to trust the direction: `judged@10` falls from 55.9% to 44.1%,
+so the deeper run diverges much further from the judgment pool. Condensed scoring
+drops unjudged documents before scoring and so controls for the obvious form of that
+bias, but it cannot credit genuinely new relevant material the pool never saw. The
+measurement says "worse among judged documents"; it cannot say "worse, full stop".
+The consistency across 15/15 cells still puts the weight of evidence on a real loss.
+
+**Do not raise `bm25_hits`.** The submitted decomposed run uses 100, which is the
+better of the two.
 
 ## Caveats
 
