@@ -1,0 +1,44 @@
+2026-08-07 22:15:11,230 INFO    run_pipeline: Decomposed mode: 119 topics matched against output_decomp/preprocessed_queries_step3.jsonl
+2026-08-07 22:15:11,232 INFO    run_pipeline: Loaded 119 topics from trec_rag_2026_test_query_set.tsv | 107 already checkpointed | 12 to run | config=configs/pipeline.decomposed.yaml
+2026-08-07 22:15:14,444 WARNING huggingface_hub.utils._http: Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-08-07 22:16:11,717 INFO    decomposed: Topic rag2026-12: 28/28 needs retrieved, pool=100 (composite=50)
+2026-08-07 22:16:45,175 INFO    decomposed: Topic rag2026-12: evidence 10 docs covering 8/8 sub-questions
+2026-08-07 22:18:12,833 INFO    run_pipeline: Topic rag2026-12 done in 174.8s (1/12, ~33 min left)
+2026-08-07 22:19:25,702 INFO    decomposed: Topic rag2026-29: 25/25 needs retrieved, pool=100 (composite=50)
+2026-08-07 22:19:47,581 INFO    decomposed: Topic rag2026-29: evidence 10 docs covering 2/2 sub-questions
+2026-08-07 22:21:22,044 INFO    run_pipeline: Topic rag2026-29 done in 189.2s (2/12, ~31 min left)
+2026-08-07 22:22:00,681 INFO    decomposed: Topic rag2026-31: 20/20 needs retrieved, pool=100 (composite=50)
+2026-08-07 22:22:22,589 INFO    decomposed: Topic rag2026-31: evidence 10 docs covering 2/2 sub-questions
+2026-08-07 22:23:44,288 INFO    run_pipeline: Topic rag2026-31 done in 142.2s (3/12, ~26 min left)
+2026-08-07 22:24:06,620 INFO    decomposed: Topic rag2026-48: 13/13 needs retrieved, pool=100 (composite=50)
+2026-08-07 22:24:25,377 INFO    decomposed: Topic rag2026-48: evidence 10 docs covering 2/2 sub-questions
+2026-08-07 22:25:43,505 INFO    run_pipeline: Topic rag2026-48 done in 119.2s (4/12, ~21 min left)
+2026-08-07 22:26:10,415 INFO    decomposed: Topic rag2026-49: 14/14 needs retrieved, pool=100 (composite=50)
+2026-08-07 22:26:32,258 INFO    decomposed: Topic rag2026-49: evidence 10 docs covering 3/3 sub-questions
+2026-08-07 22:27:46,872 INFO    run_pipeline: Topic rag2026-49 done in 123.4s (5/12, ~18 min left)
+2026-08-07 22:28:22,765 INFO    decomposed: Topic rag2026-51: 11/11 needs retrieved, pool=92 (composite=50)
+2026-08-07 22:28:43,348 INFO    decomposed: Topic rag2026-51: evidence 10 docs covering 2/2 sub-questions
+2026-08-07 22:30:32,972 INFO    run_pipeline: Topic rag2026-51 done in 166.1s (6/12, ~15 min left)
+2026-08-07 22:31:01,421 INFO    decomposed: Topic rag2026-52: 12/12 needs retrieved, pool=77 (composite=50)
+2026-08-07 22:31:24,624 INFO    decomposed: Topic rag2026-52: evidence 10 docs covering 4/4 sub-questions
+2026-08-07 22:33:03,373 INFO    run_pipeline: Topic rag2026-52 done in 150.4s (7/12, ~13 min left)
+2026-08-07 22:33:30,429 INFO    decomposed: Topic rag2026-53: 15/15 needs retrieved, pool=97 (composite=50)
+2026-08-07 22:33:52,593 INFO    decomposed: Topic rag2026-53: evidence 10 docs covering 2/2 sub-questions
+2026-08-07 22:35:17,988 INFO    run_pipeline: Topic rag2026-53 done in 134.6s (8/12, ~10 min left)
+2026-08-07 22:36:26,710 INFO    decomposed: Topic rag2026-65: 42/42 needs retrieved, pool=100 (composite=50)
+2026-08-07 22:36:48,375 INFO    decomposed: Topic rag2026-65: evidence 10 docs covering 2/2 sub-questions
+2026-08-07 22:38:02,454 INFO    generator: Topic rag2026-65: draft 1 rejected by lexical (2 of 5 sentences state things their cited passages do not support: "Before expanding, it's essential to consider the regulatory landscape …"; "When deciding whether to build one global compliance prog); regenerating
+2026-08-07 22:39:05,436 INFO    run_pipeline: Topic rag2026-65 done in 227.4s (9/12, ~8 min left)
+2026-08-07 22:39:57,119 INFO    decomposed: Topic rag2026-73: 16/16 needs retrieved, pool=100 (composite=50)
+2026-08-07 22:40:16,078 INFO    decomposed: Topic rag2026-73: evidence 10 docs covering 2/2 sub-questions
+2026-08-07 22:41:34,592 INFO    run_pipeline: Topic rag2026-73 done in 149.2s (10/12, ~5 min left)
+2026-08-07 22:42:01,256 INFO    decomposed: Topic rag2026-86: 15/15 needs retrieved, pool=100 (composite=50)
+2026-08-07 22:42:22,177 INFO    decomposed: Topic rag2026-86: evidence 10 docs covering 4/4 sub-questions
+2026-08-07 22:43:51,406 INFO    generator: Topic rag2026-86: draft 1 rejected by lexical (the answer cites nothing for sub-question(s) 2, although the evidence includes passages for them); regenerating
+2026-08-07 22:45:13,143 INFO    run_pipeline: Topic rag2026-86 done in 218.6s (11/12, ~3 min left)
+2026-08-07 22:46:49,070 INFO    decomposed: Topic rag2026-95: 28/28 needs retrieved, pool=100 (composite=50)
+2026-08-07 22:47:07,180 INFO    decomposed: Topic rag2026-95: evidence 10 docs covering 2/2 sub-questions
+2026-08-07 22:48:30,654 INFO    run_pipeline: Topic rag2026-95 done in 197.5s (12/12, ~0 min left)
+2026-08-07 22:48:30,720 INFO    run_pipeline: Wrote retrieval run: output_decomposed/r_output_trec_rag_2026.tsv (119 topics)
+2026-08-07 22:48:30,731 INFO    run_pipeline: Wrote RAG output: output_decomposed/rag_output_trec_rag_2026.jsonl (119 topics)
+2026-08-07 22:48:30,731 INFO    run_pipeline: All 119 topics present. Elapsed 33.3 min.
