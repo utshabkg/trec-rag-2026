@@ -95,6 +95,16 @@ class PyseriniClient:
         self.backoff_factor = backoff_factor
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # Latency accounting. A cached run reads ~60MB off disk instead of the
+        # network, so reporting wall clock without this split would present disk
+        # reads as API latency and understate the real cost of the system by an
+        # order of magnitude.
+        self.stats = {
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "api_seconds": 0.0,
+            "cache_seconds": 0.0,
+        }
 
     def _get_json(
         self, url: str, params: dict[str, Any] | None = None, max_attempts: int | None = None
@@ -227,17 +237,23 @@ class PyseriniClient:
         cache_path = self._cache_path("search", f"{query}|{hits}")
         payload: Any = None
         if cache_path and cache_path.is_file():
+            started = time.perf_counter()
             try:
                 payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                self.stats["cache_hits"] += 1
+                self.stats["cache_seconds"] += time.perf_counter() - started
             except (OSError, json.JSONDecodeError):
                 payload = None
 
         if payload is None:
+            started = time.perf_counter()
             payload = self._get_json(
                 f"{self.base_url}/v1/{self.index}/search",
                 params={"query": query, "hits": hits},
                 max_attempts=max_attempts,
             )
+            self.stats["cache_misses"] += 1
+            self.stats["api_seconds"] += time.perf_counter() - started
             if cache_path:
                 tmp = cache_path.with_suffix(".tmp")
                 tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

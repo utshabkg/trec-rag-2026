@@ -231,6 +231,14 @@ __marimo__/
 # checkpoints, which are build products, not source.
 /output/
 /output_*/
+!/output_decomp/
+/output_decomp/*
+!/output_decomp/preprocessed_queries*.jsonl
+/output_decomp/preprocessed_queries*_flagged.jsonl
 *.jsonl.tmp
 
 logs/
+
+# Clone of the official TREC-RAG data repo (its own git repo, 1.7GB).
+# git add -A would otherwise record it as a broken gitlink/submodule.
+trec-rag-data/

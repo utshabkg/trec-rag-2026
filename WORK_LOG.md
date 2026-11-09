@@ -302,7 +302,112 @@ Net: the two stages that were removed or narrowed are the ones that could not be
 shown to contribute; the one kept wide is the one measurement says is doing the
 work.
 
-### 5.5 Grounding
+### 5.5 First measured results on the development set
+
+`scripts/eval/` now scores runs against the RAG25 dev qrels (22 narratives, three
+projected-UMBRELA assessor variants). Everything before this section was decided
+by inspection; everything after can be decided by measurement.
+
+**Baseline, current cascade:**
+
+| assessor | nDCG@10 | nDCG@20 | nDCG@100 |
+|---|---|---|---|
+| codex-gpt5.5 | 0.4170 | 0.3776 | 0.2160 |
+| ministral-3-14b | 0.4915 | 0.4536 | 0.2537 |
+| qwen3.5-9b | 0.4356 | 0.4121 | 0.2403 |
+
+Per-topic nDCG@10 ranges 0.14–1.00 (stdev 0.198), so topic difficulty dominates
+the raw spread.
+
+**Statistical note — one to get right.** An early reading of this data used the
+*unpaired* standard error (0.198/√22 ≈ 0.042, implying ~0.084 detectable) and
+concluded the dev set could only catch large effects. That is the wrong test for
+this design: every arm is scored on the *same* topics, so topic difficulty
+cancels and the correct quantity is the standard error of the **per-topic
+differences**, measured at **0.014–0.023**. The real detectable threshold is
+therefore ≈0.04 nDCG@10, roughly twice as sensitive as first stated.
+
+**Three-arm listwise experiment** (identical except the listwise stage), paired
+per topic:
+
+| comparison | codex | ministral | qwen | verdict |
+|---|---|---|---|---|
+| top-20 vs all-50 | −0.005 (t=−0.33) | −0.004 (t=−0.25) | +0.001 (t=+0.05) | **no effect** |
+| listwise vs none | +0.027 (t=+1.54) | +0.021 (t=+0.93) | +0.013 (t=+0.61) | positive, not significant |
+
+Runtime over the 22 topics: all-50 **28.0 min**, top-20 **19.2 min**, none
+**16.0 min**.
+
+Two conclusions:
+
+1. **Narrowing listwise to `rerank_depth: 20` is free.** t-values near zero on
+   all three assessors, sign flips between them. The 4-calls-to-1 change bought
+   ~31% wall clock at no measurable cost. This was previously a cost argument
+   with no evidence; it now has evidence.
+2. **Keep listwise; do not remove it.** Every assessor puts it ahead of no
+   listwise (+0.013 to +0.027, 40 wins / 26 losses pooled, sign test p=0.109 —
+   indicative, not significant, and the three assessors are not independent).
+   Crucially it now costs only **~3 min over 22 topics (~9 s/topic)** at
+   `rerank_depth: 20`, not the ~85% of runtime it consumed at all-50. A cheap
+   stage with a consistently positive sign is worth keeping even when the effect
+   cannot be resolved at n=22.
+
+**Caveat on recall metrics.** ~900 documents/topic are graded ≥2 in these
+projected qrels (76% of everything judged), so R@100 is capped near 0.14 and MAP
+near 0.02 regardless of system quality. `R@100 == R@1000` in every arm because we
+submit 50 documents. Compare systems on nDCG@10/@20; treat the recall column as
+diagnostic only, and note that a grade≥3 cut (~213 docs/topic) would be the more
+discriminating threshold if recall becomes the question.
+
+### 5.6 Latency breakdown (and a correction)
+
+`scripts/eval/report_latency.py` reports per-stage wall clock from the same
+`stages_*.jsonl` the quality diagnostics use, so cost and benefit are measured on
+the same runs.
+
+**Hardware:** 2× NVIDIA RTX 6000 Ada (49140 MiB each, driver 575.57.08),
+Intel Xeon w9-3595X (120 logical cores), 754 GB RAM, Linux 6.1.0-47.
+Single process, one narrative at a time (`--workers 1`): the neural stages share
+one model instance each, so these are serial per-narrative latencies, not a
+throughput-optimised deployment.
+
+| stage | kind | mean s/narrative | share |
+|---|---|---|---|
+| bm25 | network (Pyserini) | 0.23 *(cached)* / **4.23 cold** | 0.5% |
+| passage_selection | CPU | 0.96 | 1.9% |
+| biencoder | GPU | 4.96 | 9.8% |
+| rrf / ltr / colbert | CPU | ~0.00 | 0.0% |
+| cross_encoder | GPU | 0.45 | 0.9% |
+| llm_listwise | LLM | 9.89 | 19.5% |
+| **generation** | **LLM** | **34.10** | **67.4%** |
+| **total** | | **50.59** | 100% |
+
+≈71 narratives/hour cached; ≈66/hour with live retrieval (~108 min for the
+119-narrative test set).
+
+**Correction.** This log and several working notes described the listwise stage
+as "~85% of runtime". That was wrong. Measured: at `rerank_depth: 20` listwise is
+**19.5%** (9.89 s), and even at all-50 it was ~32 s of a ~76 s narrative, i.e.
+~42%. The claim came from noticing that removing listwise saved time, without
+ever measuring the remainder.
+
+**The actual bottleneck is answer generation at 67.4%** — a single LLM call per
+narrative producing up to 1024 words. That reframes the per-facet generation plan
+(§5.2): moving to one generation pass per sub-question addresses the coverage
+ceiling, but at a mean 2.40 sub-questions per narrative it also multiplies the
+*dominant* cost term, not a marginal one. Budget for roughly 2–2.5× total runtime
+unless the per-facet calls are shorter than the current single call.
+
+**The Pyserini API is not the bottleneck** at this scale: 4.23 s/narrative cold
+(measured live, hits=1000, 7–10 MB responses) against 34 s of generation. Worth
+stating in the paper, since API latency is the intuitive suspect.
+
+**Cache caveat for any published figure.** Retrieval responses are cached, so the
+`bm25` row is a local disk read (0.23 s) rather than live latency (4.23 s) — a
+~18× difference for identical code. The report prints both and labels which is
+which; a latency table in the paper must say which condition it describes.
+
+### 5.7 Grounding
 
 Of 1,135 checkable sentences: 309 verbatim-match a cited doc, 33 match an
 uncited-but-present doc, the rest are paraphrase. **The failure mode is
@@ -317,10 +422,39 @@ Decomposition addresses both open problems at once: it is the only lever on
 recall under a sparse-only index (§3.1), and per-sub-question generation is the
 structural fix for coverage (§5.2).
 
-- **Step 1 — built and tested** (`scripts/decompose/`, spec in
+- **Step 1 — DONE** (`scripts/decompose/`, spec in
   `plans/decompose/preprocessing_step_1.md`). vLLM offline batch, XML tags with a
   deterministic parser, one fallback retry, independent pre-write gate, flagged
   file so no query can silently vanish.
+
+  **Run:** Qwen2.5-72B-Instruct-AWQ, tensor_parallel_size=2, temperature 0.
+  Output banked at `datasets/trec/trec-rag-2026/decompositions/step1_20260801_0841/`.
+
+  | | |
+  |---|---|
+  | parsed on first attempt | **119/119** (0 fallbacks, 0 flagged) |
+  | `comp_query` preserved exactly | yes, all 119 |
+  | sub-questions per narrative | 1:16, 2:67, 3:18, 4:11, 5:6, 8:1 — mean **2.40** |
+  | narratives with no framing (empty metadata) | 16/119 |
+  | content-word recall of the original | mean **0.991**, median 1.000, min 0.823 |
+
+  Verbatim fidelity measured 67.5% exact / 15.0% near-verbatim / 17.5%
+  "materially rewritten", but inspection shows the last bucket is almost entirely
+  the prompt's own allowance — merging a sentence the asker split ("Write an
+  investment plan… Specifically, the timespan…") or fixing a dangling connective
+  so the question stands alone. The strict test required the whole normalised
+  string to appear contiguously, which any sentence join fails. Content-word
+  recall of 0.991 confirms nothing substantive is dropped; the missing tokens are
+  function words (`have`, `any`, `even`, `furthermore`).
+
+  Spot-check: `rag2026-0` reproduces the worked decomposition in Debayan's spec
+  exactly — the two framing sentences as metadata, and the "what should we
+  prioritize" and "how should we think about tradeoffs" questions as the two
+  sub-questions.
+
+  *Note for the paper:* mean 2.40 sub-questions per narrative is the direct
+  justification for per-facet generation (§5.2) — the baseline emits a
+  near-constant 9.5 sentences regardless of how many questions were asked.
 - **Step 2 — to build:** retrieve per sub-question, RRF-fuse with the base run.
 - **Step 3 — to build:** one generation pass per sub-question, assembled.
 

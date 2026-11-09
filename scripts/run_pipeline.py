@@ -27,8 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from trecrag.config import load_dotenv_local, load_pipeline_config
 from trecrag.data.topics import load_topics
+from trecrag.decomposed.loader import attach, load_decomposed_topics
 from trecrag.diagnostics import StageDiagnostics
-from trecrag.factory import build_pipeline_from_config
+from trecrag.factory import build_decomposed_pipeline_from_config, build_pipeline_from_config
 from trecrag.logging_utils import configure_logging, get_logger
 from trecrag.output.checkpoint import TopicCheckpointStore
 from trecrag.output.writers import build_rag_record, write_rag_jsonl, write_retrieval_run
@@ -63,6 +64,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-dir", default="logs", help="Directory for run + stage logs")
     parser.add_argument("--no-diagnostics", action="store_true",
                         help="Skip per-stage diagnostics JSONL")
+    parser.add_argument(
+        "--decomposition",
+        default=None,
+        help="Path to step-3 decomposition JSONL. Overrides `decomposition.path` in "
+             "the config; per-AIN mode is selected by the config carrying a "
+             "`decomposition:` block.",
+    )
+    parser.add_argument(
+        "--per-ain-diagnostics",
+        action="store_true",
+        help="Record per-stage diagnostics for every AIN cascade, not just the "
+             "aggregate (~64x more records per topic)",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -85,6 +99,21 @@ def main() -> None:
     topics = load_topics(args.topics)
     if args.limit is not None:
         topics = topics[: args.limit]
+
+    if args.decomposition:
+        config.setdefault("decomposition", {})["path"] = args.decomposition
+    decomposed_mode = "decomposition" in config
+    if decomposed_mode:
+        # Validated before anything is built: a missing decomposition would
+        # otherwise surface after a multi-minute model load, and the failure
+        # ("no decomposition for topic X") is a preprocessing gap, not a run
+        # failure worth paying for that load to discover.
+        decomposition_path = config["decomposition"]["path"]
+        attach(topics, load_decomposed_topics(decomposition_path))
+        logger.info(
+            "Decomposed mode: %d topics matched against %s",
+            len(topics), decomposition_path,
+        )
 
     diagnostics = StageDiagnostics(
         None if args.no_diagnostics else log_dir / f"stages_{args.run_id}_{stamp}.jsonl"
@@ -121,7 +150,13 @@ def main() -> None:
         )
 
     if pending:
-        pipeline = build_pipeline_from_config(config, diagnostics=diagnostics)
+        pipeline = (
+            build_decomposed_pipeline_from_config(
+                config, diagnostics=diagnostics, per_ain_diagnostics=args.per_ain_diagnostics
+            )
+            if decomposed_mode
+            else build_pipeline_from_config(config, diagnostics=diagnostics)
+        )
         if args.workers > 1:
             logger.warning(
                 "--workers %d: neural stages share one model instance per stage; "

@@ -48,3 +48,39 @@ class TestReciprocalRankFusion(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPerListWeights(unittest.TestCase):
+    """`weights` must not disturb existing callers, and must let a list that is
+    outnumbered still carry its share of the vote."""
+
+    def test_omitting_weights_matches_all_ones(self):
+        lists = [[_cand("a", 1), _cand("b", 2)], [_cand("b", 1), _cand("c", 2)]]
+        default = reciprocal_rank_fusion([list(x) for x in lists])
+        explicit = reciprocal_rank_fusion([list(x) for x in lists], weights=[1.0, 1.0])
+        self.assertEqual(
+            [(c.docid, round(c.score, 12)) for c in default],
+            [(c.docid, round(c.score, 12)) for c in explicit],
+        )
+
+    def test_a_heavier_list_promotes_its_documents(self):
+        outnumbered = [_cand("z", 1)]
+        crowd = [[_cand("a", 1)], [_cand("a", 1)], [_cand("a", 1)]]
+        at_parity = reciprocal_rank_fusion([*[list(x) for x in crowd], list(outnumbered)])
+        self.assertEqual(at_parity[0].docid, "a")
+
+        weighted = reciprocal_rank_fusion(
+            [*[list(x) for x in crowd], list(outnumbered)], weights=[1.0, 1.0, 1.0, 10.0]
+        )
+        self.assertEqual(weighted[0].docid, "z")
+
+    def test_zero_weight_contributes_nothing(self):
+        fused = reciprocal_rank_fusion(
+            [[_cand("a", 1)], [_cand("z", 1)]], weights=[1.0, 0.0]
+        )
+        self.assertEqual({c.docid: c.score for c in fused}["z"], 0.0)
+        self.assertEqual(fused[0].docid, "a")
+
+    def test_length_mismatch_raises(self):
+        with self.assertRaises(ValueError):
+            reciprocal_rank_fusion([[_cand("a", 1)], [_cand("b", 1)]], weights=[1.0])

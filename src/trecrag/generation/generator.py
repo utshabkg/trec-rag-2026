@@ -15,8 +15,13 @@ from abc import ABC, abstractmethod
 
 from trecrag.clients.llm_client import LLMClient
 from trecrag.generation.postprocess import postprocess_rag_answer
+from trecrag.generation.prompts import Revision, render_answer_prompt
+from trecrag.generation.verifier import AnswerVerifier
+from trecrag.logging_utils import get_logger
 from trecrag.schema import AnswerSentence, Candidate, RagAnswer, Topic
 from trecrag.text_utils import split_sentences, tokenize
+
+logger = get_logger("generator")
 
 _JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
 
@@ -61,9 +66,30 @@ class ExtractiveGenerator(Generator):
 
 
 class LLMGenerator(Generator):
-    def __init__(self, llm: LLMClient, fallback: Generator | None = None):
+    # A 1024-word cited answer is ~1900 tokens of JSON; 2048 truncated the array
+    # often enough that the parse failed and silently dropped to the extractive
+    # fallback. A think block is spent before any of that is emitted, so asking
+    # for one without raising the ceiling would reintroduce that truncation.
+    BASE_MAX_TOKENS = 4096
+    THINKING_TOKEN_HEADROOM = 2048
+
+    def __init__(
+        self,
+        llm: LLMClient,
+        fallback: Generator | None = None,
+        thinking: bool = False,
+        verifier: AnswerVerifier | None = None,
+        max_attempts: int = 1,
+        max_tokens: int | None = None,
+    ):
         self.llm = llm
         self.fallback = fallback or ExtractiveGenerator()
+        self.thinking = thinking
+        self.verifier = verifier
+        self.max_attempts = max(1, max_attempts)
+        self.max_tokens = max_tokens or (
+            self.BASE_MAX_TOKENS + (self.THINKING_TOKEN_HEADROOM if thinking else 0)
+        )
 
     def generate(
         self, topic: Topic, evidence: list[Candidate], max_words: int, max_citations: int
@@ -72,73 +98,70 @@ class LLMGenerator(Generator):
         if not usable:
             return RagAnswer(references=[], sentences=[])
 
-        prompt = self._build_prompt(topic, usable, max_words, max_citations)
-        # A 1024-word cited answer is ~1900 tokens of JSON; 2048 truncated the
-        # array often enough that the parse failed and silently dropped to the
-        # extractive fallback.
-        response = self.llm.complete(prompt, max_tokens=4096)
+        references = [c.docid for c in usable]
+        revision: Revision | None = None
+        last_answer: RagAnswer | None = None
+
+        for attempt in range(1, self.max_attempts + 1):
+            answer = self._attempt(topic, usable, references, max_words, max_citations, revision)
+            if answer is None or not answer.sentences:
+                # Unparsable, or nothing survived post-processing (e.g. every
+                # citation was unusable), which would submit an empty answer and
+                # score zero for this narrative. An extractive answer beats none.
+                return self.fallback.generate(topic, evidence, max_words, max_citations)
+
+            last_answer = answer
+            if self.verifier is None or attempt == self.max_attempts:
+                return answer
+
+            result = self.verifier.verify(topic, usable, answer)
+            if result.ok:
+                if not result.checked:
+                    # Shipping unverified. Logged per topic so a run that
+                    # believes it verified 119 answers cannot quietly have
+                    # verified none.
+                    logger.warning(
+                        "Topic %s: answer shipped WITHOUT verification (%s could not judge)",
+                        topic.topic_id, self.verifier.name,
+                    )
+                return answer
+            logger.info(
+                "Topic %s: draft %d rejected by %s (%s); regenerating",
+                topic.topic_id, attempt, self.verifier.name, "; ".join(result.issues)[:200],
+            )
+            revision = result.as_revision()
+
+        # Unreachable while max_attempts >= 1, but returning the last draft is
+        # the correct exhaustion behaviour: a rejected answer still beats none.
+        return last_answer or self.fallback.generate(topic, evidence, max_words, max_citations)
+
+    def _attempt(
+        self,
+        topic: Topic,
+        usable: list[Candidate],
+        references: list[str],
+        max_words: int,
+        max_citations: int,
+        revision: Revision | None,
+    ) -> RagAnswer | None:
+        prompt = render_answer_prompt(
+            question=topic.text,
+            passage_texts=[c.text or "" for c in usable],
+            max_words=max_words,
+            max_citations=max_citations,
+            thinking=self.thinking,
+            revision=revision,
+        )
+        # `<think>` blocks are removed by the client's `strip_reasoning`, which
+        # also drops an unterminated one to end-of-string -- without that, a
+        # think block cut off by the token budget would leave its digits and
+        # brackets for `_JSON_ARRAY_RE` to parse as the answer.
+        response = self.llm.complete(prompt, max_tokens=self.max_tokens)
         parsed = self._parse_response(response, len(usable))
         if parsed is None:
-            return self.fallback.generate(topic, evidence, max_words, max_citations)
-
-        references = [c.docid for c in usable]
+            return None
         sentences = [AnswerSentence(text=s["text"], citations=s["citations"]) for s in parsed]
-        answer = postprocess_rag_answer(references, sentences, max_words, max_citations)
-        if not answer.sentences:
-            # Parsed fine but nothing survived post-processing (e.g. every
-            # citation was unusable), which would submit an empty answer and
-            # score zero for this narrative. An extractive answer beats none.
-            return self.fallback.generate(topic, evidence, max_words, max_citations)
-        return answer
-
-    @staticmethod
-    def _build_prompt(
-        topic: Topic, usable: list[Candidate], max_words: int, max_citations: int
-    ) -> str:
-        lines = [
-            "You are writing a grounded, cited answer to a research question using only "
-            "the evidence passages below.",
-            f"Question: {topic.text}",
-            "",
-            "Evidence passages:",
-        ]
-        for i, candidate in enumerate(usable):
-            lines.append(f"[{i}] {(candidate.text or '')[:2500]}")
-        lines += [
-            "",
-            # These narratives bundle several distinct sub-questions and are scored
-            # on how much of the expected content the answer covers, so an explicit
-            # length target matters: "at most N words" alone reliably produced
-            # ~250-word answers against a 1024-word budget.
-            f"Write a thorough answer of {int(max_words * 0.6)}-{int(max_words * 0.9)} "
-            f"words (hard maximum {max_words}), as a JSON array of objects with "
-            '"text" and "citations".',
-            "Identify every distinct sub-question the request asks and address each "
-            "one explicitly; breadth of coverage matters more than depth on any "
-            "single point.",
-            # Each of these was an observed failure in a real 119-narrative run.
-            "Write the answer itself. Do not restate or summarise the question, and "
-            "do not describe what the request is asking -- 21 of 119 answers opened "
-            "with 'The question asks...', which wastes the word budget and reads "
-            "poorly to a judge.",
-            "Never mention the evidence passages as objects. Write 'Subletting can "
-            "be a viable option', not 'Passage [6] notes that subletting...'. The "
-            "citation field carries attribution; the prose must not.",
-            "Answer in the register the request asks for: if it asks for an outline, "
-            "a blog post, a script or a one-pager, produce that artefact rather than "
-            "describing what one would contain.",
-            "Address the person's stated situation and constraints directly, using "
-            "their terms.",
-            "Where the evidence is thin, give the best conditional guidance it "
-            "supports ('prioritise X if A, otherwise Y') instead of stating that the "
-            "evidence is insufficient.",
-            f'"citations" must be a list of at most {max_citations} zero-based indices '
-            "into the evidence passages above, ordered strongest support first.",
-            "Every sentence must be supported by at least one cited passage. Do not "
-            "invent facts absent from the evidence.",
-            'Respond with only the JSON array, e.g. [{"text": "...", "citations": [0, 2]}].',
-        ]
-        return "\n".join(lines)
+        return postprocess_rag_answer(references, sentences, max_words, max_citations)
 
     @staticmethod
     def _parse_response(response: str, num_evidence: int) -> list[dict] | None:

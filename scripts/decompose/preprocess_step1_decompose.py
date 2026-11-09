@@ -10,10 +10,21 @@ script splits each topic into a `query_metadata` string and an ordered list of
         -> vLLM offline batch generation
         -> <metadata>/<sub_question> XML tags
         -> deterministic regex parse + validation
+        -> step 1b: <dependencies> XML tags, same run, same model session
         -> preprocessed_queries_step1.jsonl
 
+Step 1b asks a second question of the same loaded model: among a query's
+sub-questions, does answering one require knowing the answer to another first? The
+verdict lands in a `dependencies` field on the same record, so a single run of this
+script produces the finished file -- there is no second script and nothing reads the
+main output back in. Most pairs have no dependency, and that is the expected answer.
+
 Anything that fails twice is written to the flagged file instead, never dropped:
-every input query_id appears in exactly one of the two outputs.
+every input query_id appears in exactly one of the two outputs. That includes a topic
+that decomposed cleanly but whose dependency judgement could not be pinned down --
+it is redirected to the flagged file (`failure_stage: "dependency-detection"`) rather
+than written with a guessed `dependencies` value, which keeps the main output's
+invariant absolute: every record in it has a fully validated `dependencies` field.
 
 QUICKSTART
     # Use the dedicated vLLM env, NOT trec-rag-2026. vLLM 0.13 pins torch 2.9,
@@ -55,7 +66,9 @@ import json
 import logging
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -87,6 +100,22 @@ TEMPERATURE = 0.0                 # deterministic: this is extraction, not gener
 TOP_P = 1.0
 SEED = 0
 BATCH_SIZE = 0                    # 0 = submit every prompt in one generate() call
+
+# Step 1b (dependency detection) knobs.
+PAIRWISE_API = False   # False = judge all of a query's sub-question pairs in one
+                       # LLM call (default). True = one LLM call per individual
+                       # pair. Only matters once queries have 3+ sub-questions;
+                       # with the current at-most-2 dataset the two modes are
+                       # functionally identical (both do exactly one call per
+                       # query, since there's at most one pair). Flip to True if
+                       # a future dataset has enough sub-questions per query that
+                       # judging every pair implicitly within a single prompt
+                       # risks the model losing precision.
+DEPENDENCY_MAX_TOKENS = 512       # an empty verdict is ~10 tokens and one dependency
+                                  # ~25, so this is generous even for a query with
+                                  # many sub-questions -- but far below MAX_TOKENS,
+                                  # so a runaway generation is cut off early instead
+                                  # of burning the batch.
 
 # Used only when the tokenizer has no chat_template (e.g. the local gemma-4-31B-it).
 CHAT_TEMPLATE_FALLBACK = (
@@ -190,6 +219,268 @@ Hard rules:
 - Background/context goes in metadata. Questions go in sub_question tags.
 
 Query: {query_text}
+"""
+
+
+# --- step 1b: dependency detection -----------------------------------------------
+# Two prompt pairs, one per PAIRWISE_API mode. Both emit the same <dependencies>
+# wrapper so everything downstream -- parser, gate, retry, flagging -- is shared.
+# The hard part of this judgement is not finding dependencies but NOT finding them:
+# every pair shares a topic and a metadata blob, which reads as relatedness, and a
+# model that mistakes relatedness for an ordering constraint will tag nearly
+# everything. Hence "no dependency is the default" is stated in all four prompts and
+# the worked examples all use the SAME metadata, so the only thing distinguishing them
+# is whether one answer actually feeds the other.
+#
+# Measured on the 119-topic test set (Qwen2.5-72B-AWQ, temperature 0, 275 pairs): an
+# isolated yes/no judgement biases hard toward yes. An earlier pairwise prompt with
+# the same two examples as the batched one tagged 57% of pairs against the batched
+# prompt's 36%, and 72 of their 94 disagreements were the pairwise call adding an edge
+# the batched call did not. Adding a third worked example -- a second independent pair,
+# both questions about the same plan -- brought pairwise to 33% against batched's 38%,
+# and mode agreement from 66% to 75%. The batched prompt does not carry that third
+# example: judging every pair in one pass exposes the base rate on its own.
+
+DEPENDENCY_SYSTEM_PROMPT = """\
+You judge whether one sub-question has to be answered before another one can be \
+answered well. You judge the ordering only. You never answer the sub-questions, and \
+you never rewrite them.
+
+You are given the asker's METADATA (their situation, constraints, and framing) and \
+the numbered SUB-QUESTIONS taken from a single query. Consider every pair of \
+sub-questions.
+
+Sub-question B DEPENDS ON sub-question A when a good answer to B cannot be written \
+until the answer to A is settled -- B is about the choice, plan, set, or outcome that \
+A produces, so answering B first would mean guessing at A's answer.
+
+Apply this test to each pair, in both directions: could a well-informed writer answer \
+B completely without first stating an answer to A? If yes, there is no dependency.
+
+NO DEPENDENCY IS THE DEFAULT, AND THE COMMON CASE. Most pairs are simply two facets \
+of one topic that can be answered in either order. Do NOT tag a dependency merely \
+because:
+
+- the two sub-questions are about the same subject, or draw on the same metadata;
+- one is asked before the other in the query;
+- answering both together would read more naturally;
+- one is broad and the other is narrow, or one is "what" and the other is "how";
+- one states a requirement on the other's answer (sources to use, length, tone). A \
+constraint shapes an answer; it is not something that has to be answered first.
+
+Tag a dependency ONLY when there is a genuine answer-order requirement. When in \
+doubt, tag nothing.
+
+Use the metadata as evidence: stated priorities, constraints, deadlines, or a \
+sequence the asker already implies can turn an ambiguous ordering into a real one, \
+and can equally make clear that two questions are independent.
+
+Output format - emit ONLY these tags, nothing else. No preamble, no trailing \
+commentary, no markdown code fences, no explanation:
+
+<dependencies>
+<dependency from="1" to="2"/>
+</dependencies>
+
+<dependency from="X" to="Y"/> means sub-question Y depends on sub-question X, so X \
+must be answered first. Rules for the tags:
+
+- Use the sub-question ids exactly as they are given to you, and no others.
+- The two ids in a tag must differ: a sub-question never depends on itself.
+- One tag per pair at most. Never emit the same pair twice, and never emit both \
+directions for one pair - choose the single stronger direction, or neither.
+- When you find no dependency at all, still emit the wrapper, empty:
+
+<dependencies></dependencies>
+
+Never reply with an empty message. The empty wrapper is how you say "I considered \
+the pairs and there is no dependency", and it is a perfectly good answer.
+
+Example A - a genuine dependency. The migration asked about in sub-question 2 is a \
+property of whichever tool sub-question 1 settles on, so 1 has to be answered first:
+
+Metadata: I manage a 12-person support team and we are moving off shared email onto a \
+ticketing tool next quarter.
+Sub-questions:
+1. Which ticketing tool should we choose for our volume and budget?
+2. How do we migrate three years of existing email threads into it without losing \
+history?
+
+<dependencies>
+<dependency from="1" to="2"/>
+</dependencies>
+
+Example B - same asker, same topic, but independent. Both questions are about \
+running the team, yet neither answer needs the other one first, so nothing is tagged:
+
+Metadata: I manage a 12-person support team and we are moving off shared email onto a \
+ticketing tool next quarter.
+Sub-questions:
+1. What first-response time is realistic for a team our size?
+2. How do other teams this size handle weekend coverage?
+
+<dependencies></dependencies>
+"""
+
+DEPENDENCY_USER_TEMPLATE = """\
+Metadata: {metadata}
+Sub-questions:
+{sub_questions}"""
+
+# Same relationship to DEPENDENCY_SYSTEM_PROMPT that DECOMPOSITION_FALLBACK_PROMPT
+# has to DECOMPOSITION_SYSTEM_PROMPT: drop the conceptual framing, make the output
+# shape the whole message. Re-sending the identical prompt to the same weights at
+# temperature 0 would reproduce the same failure, so the retry has to differ.
+DEPENDENCY_FALLBACK_PROMPT = """\
+Decide which of the sub-questions below must be answered before which. Output XML \
+tags and NOTHING else.
+
+Required shape, exactly:
+
+<dependencies>
+<dependency from="X" to="Y"/>
+</dependencies>
+
+Hard rules:
+- Start your reply with the character < and end it with the character >.
+- No code fences. No "Here is". No notes before or after the tags.
+- Exactly one <dependencies> wrapper. Keep it even when nothing goes inside it: \
+<dependencies></dependencies>
+- <dependency from="X" to="Y"/> means Y cannot be answered until X is answered.
+- X and Y must both be taken from this id list, and must differ: {ids}
+- At most one tag per pair, and never both from="X" to="Y" and from="Y" to="X".
+- Emit a tag ONLY if answering one question really requires the other's answer \
+first. Test each pair: if one could be answered completely without first answering \
+the other, emit nothing for it. Two questions on the same topic are NOT a dependency, \
+and emitting no tags at all is the normal, expected answer.
+
+Metadata: {metadata}
+Sub-questions:
+{sub_questions}
+"""
+
+DEPENDENCY_PAIRWISE_SYSTEM_PROMPT = """\
+You are given the asker's METADATA (their situation, constraints, and framing) and \
+exactly TWO sub-questions taken from a single query. Decide whether one of them has \
+to be answered before the other. You judge the ordering only. You never answer the \
+sub-questions, and you never rewrite them.
+
+Sub-question B DEPENDS ON sub-question A when a good answer to B cannot be written \
+until the answer to A is settled -- B is about the choice, plan, set, or outcome that \
+A produces, so answering B first would mean guessing at A's answer.
+
+There are exactly three possible verdicts, and the third is the most common:
+
+1. the second depends on the first;
+2. the first depends on the second;
+3. neither - they can be answered in either order, independently.
+
+Apply this test in both directions: could a well-informed writer answer one of them \
+completely without first stating an answer to the other? If yes either way round, the \
+verdict is 3.
+
+VERDICT 3 IS THE DEFAULT, AND MOST PAIRS ARE VERDICT 3. The two sub-questions in \
+front of you were taken from one query, so they will always look related; that is not \
+what you are judging. Do NOT report a dependency merely because:
+
+- both are about the same subject, or draw on the same metadata;
+- one is asked before the other in the query;
+- answering both together would read more naturally;
+- one is broad and the other is narrow, or one is "what" and the other is "how";
+- one states a requirement on the other's answer (sources to use, length, tone). A \
+constraint shapes an answer; it is not something that has to be answered first.
+
+Report a dependency ONLY when there is a genuine answer-order requirement. When in \
+doubt, report none.
+
+Use the metadata as evidence: stated priorities, constraints, deadlines, or a \
+sequence the asker already implies can turn an ambiguous ordering into a real one, \
+and can equally make clear that the two questions are independent.
+
+Output format - emit ONLY these tags, nothing else. No preamble, no trailing \
+commentary, no markdown code fences, no explanation:
+
+<dependencies>
+<dependency from="X" to="Y"/>
+</dependencies>
+
+<dependency from="X" to="Y"/> means sub-question Y depends on sub-question X, so X \
+must be answered first. X and Y must be the two ids you were given, and must differ. \
+Emit at most one tag: only one pair is under consideration.
+
+For verdict 3, still emit the wrapper, empty:
+
+<dependencies></dependencies>
+
+Never reply with an empty message. The empty wrapper is how you say "I considered \
+this pair and there is no dependency", and it is a perfectly good answer.
+
+Example A - a genuine dependency. The migration asked about in sub-question 2 is a \
+property of whichever tool sub-question 1 settles on, so 1 has to be answered first:
+
+Metadata: I manage a 12-person support team and we are moving off shared email onto a \
+ticketing tool next quarter.
+Sub-question 1: Which ticketing tool should we choose for our volume and budget?
+Sub-question 2: How do we migrate three years of existing email threads into it \
+without losing history?
+
+<dependencies>
+<dependency from="1" to="2"/>
+</dependencies>
+
+Example B - same asker, same topic, but independent. Both questions are about \
+running the team, yet neither answer needs the other one first, so nothing is tagged:
+
+Metadata: I manage a 12-person support team and we are moving off shared email onto a \
+ticketing tool next quarter.
+Sub-question 1: What first-response time is realistic for a team our size?
+Sub-question 2: How do other teams this size handle weekend coverage?
+
+<dependencies></dependencies>
+
+Example C - both questions are about the very same migration, and still independent: \
+the training plan and the customer announcement can each be written without the \
+other:
+
+Metadata: I manage a 12-person support team and we are moving off shared email onto a \
+ticketing tool next quarter.
+Sub-question 1: How should we train the team on the new tool?
+Sub-question 2: What should we tell customers about the change?
+
+<dependencies></dependencies>
+"""
+
+DEPENDENCY_PAIRWISE_USER_TEMPLATE = """\
+Metadata: {metadata}
+Sub-question {id_a}: {text_a}
+Sub-question {id_b}: {text_b}"""
+
+# The pairwise retry can be blunter than the batched one: with only two ids in play
+# there are exactly three legal replies, so the prompt can simply list them.
+DEPENDENCY_PAIRWISE_FALLBACK_PROMPT = """\
+Two sub-questions are below. Decide whether one must be answered before the other. \
+Output XML and NOTHING else.
+
+Your reply must be exactly one of these three lines:
+
+<dependencies><dependency from="{id_a}" to="{id_b}"/></dependencies>
+<dependencies><dependency from="{id_b}" to="{id_a}"/></dependencies>
+<dependencies></dependencies>
+
+- Choose the first if sub-question {id_b} cannot be answered until sub-question \
+{id_a} is answered.
+- Choose the second if sub-question {id_a} cannot be answered until sub-question \
+{id_b} is answered.
+- Choose the third if neither needs the other's answer first. This is the normal \
+case: being on the same topic is NOT a dependency. Test it -- if one could be \
+answered completely without first answering the other, choose the third.
+
+Start your reply with the character < and end it with the character >. No code \
+fences, no explanation, no ids other than {id_a} and {id_b}.
+
+Metadata: {metadata}
+Sub-question {id_a}: {text_a}
+Sub-question {id_b}: {text_b}
 """
 
 
@@ -358,6 +649,403 @@ def validate_final_record(record: Any) -> None:
 
 
 # --------------------------------------------------------------------------------
+# 3c. DEPENDENCY DETECTION (step 1b) -- runs in-process, in the same invocation,
+#     on records that have already cleared the decomposition final gate.
+# --------------------------------------------------------------------------------
+
+# The wrapper is matched in two forms: the required <dependencies></dependencies> and
+# the self-closed <dependencies/>. Both are an explicit "I considered the pairs and
+# found none"; only a blank reply is ambiguous, and that still fails. Tolerating the
+# self-closed spelling is the same call as stripping ``` fences above -- a formatting
+# artefact, not a failed judgement.
+_DEPS_BLOCK_RE = re.compile(
+    r"<dependencies\s*>(.*?)</dependencies\s*>|<dependencies\s*/>", re.DOTALL | re.IGNORECASE
+)
+_DEP_TAG_RE = re.compile(r"<dependency\b([^<>]*?)/>", re.DOTALL | re.IGNORECASE)
+_DEP_ATTR_RE = re.compile(r"""(\w+)\s*=\s*["']([^"']*)["']""")
+
+
+def parse_dependencies(
+    raw_output: str,
+    valid_ids: Iterable[str],
+    expected_pair: tuple[str, str] | None = None,
+) -> list[dict[str, str]]:
+    """Parse a <dependencies> block into the final `dependencies` schema.
+
+    All-or-nothing, exactly like parse_decomposition: a hallucinated id or a stray
+    sentence fails the whole judgement rather than being dropped, because silently
+    discarding half a verdict is indistinguishable in the output from the model
+    having answered "no dependency".
+
+    `expected_pair` is supplied only in PAIRWISE_API mode, where a single call judges
+    one specific pair and any tag must reference exactly those two ids.
+    """
+    if raw_output is None:
+        raise DecompositionParseError("empty generation")
+
+    text = _FENCE_RE.sub("", raw_output.strip())
+    if not text:
+        raise DecompositionParseError("empty generation")
+
+    # Rule 1: exactly one <dependencies> wrapper.
+    blocks = list(_DEPS_BLOCK_RE.finditer(text))
+    if len(blocks) != 1:
+        raise DecompositionParseError(
+            f"dep-rule1: expected exactly 1 <dependencies> block, found {len(blocks)}"
+        )
+    block = blocks[0]
+
+    # Rule 5a: nothing but whitespace outside the wrapper.
+    outside = (text[: block.start()] + text[block.end() :]).strip()
+    if outside:
+        raise DecompositionParseError(
+            f"dep-rule5: stray text outside <dependencies>: {outside[:80]!r}"
+        )
+
+    inner = block.group(1) or ""   # group(1) is None for the self-closed spelling
+    tags = list(_DEP_TAG_RE.finditer(inner))
+
+    # Rule 5b: inside the wrapper, only self-closing <dependency/> tags and
+    # whitespace. Without this, "<dependencies>1 must come first</dependencies>"
+    # would parse as an empty list, i.e. as the opposite verdict.
+    remainder, cursor = [], 0
+    for match in tags:
+        remainder.append(inner[cursor : match.start()])
+        cursor = match.end()
+    remainder.append(inner[cursor:])
+    stray = "".join(remainder).strip()
+    if stray:
+        raise DecompositionParseError(
+            f"dep-rule5: stray text inside <dependencies>: {stray[:80]!r}"
+        )
+
+    # Rule 7a (pairwise only): one pair was judged, so at most one tag can come back.
+    if expected_pair is not None and len(tags) > 1:
+        raise DecompositionParseError(
+            f"dep-rule7: {len(tags)} <dependency> tags for a single pair, expected at most 1"
+        )
+
+    valid = set(valid_ids)
+    pairs: list[tuple[str, str]] = []
+    for match in tags:
+        attrs = dict(_DEP_ATTR_RE.findall(match.group(1)))
+        if set(attrs) != {"from", "to"}:
+            raise DecompositionParseError(
+                f"dep-rule1: <dependency> needs exactly from= and to=, got {sorted(attrs)}"
+            )
+        source, target = attrs["from"].strip(), attrs["to"].strip()
+
+        # Rule 2: both ids must exist in this query.
+        if source not in valid or target not in valid:
+            raise DecompositionParseError(
+                f"dep-rule2: unknown sub_question id in {source!r} -> {target!r}; "
+                f"valid ids are {sorted(valid)}"
+            )
+        # Rule 3: no self-dependency.
+        if source == target:
+            raise DecompositionParseError(f"dep-rule3: self-dependency on id {source!r}")
+        # Rule 7b (pairwise only): nothing else was under consideration in this call.
+        if expected_pair is not None and {source, target} != set(expected_pair):
+            raise DecompositionParseError(
+                f"dep-rule7: tag {source!r} -> {target!r} is not the judged pair "
+                f"{tuple(expected_pair)}"
+            )
+        pairs.append((source, target))
+
+    # Rule 4: no duplicate pair.
+    if len(set(pairs)) != len(pairs):
+        raise DecompositionParseError(f"dep-rule4: duplicate <dependency> pair in {pairs}")
+    # Rule 6: no pair asserted in both directions. Resolving that heuristically would
+    # mean inventing a verdict the model did not give.
+    for source, target in pairs:
+        if (target, source) in pairs:
+            raise DecompositionParseError(
+                f"dep-rule6: contradictory pair {source}->{target} and {target}->{source}"
+            )
+
+    return [{"depends_on": source, "dependent": target} for source, target in pairs]
+
+
+def validate_dependencies(dependencies: Any, sub_questions: Any) -> None:
+    """Final gate for the `dependencies` field, independent of parse_dependencies.
+
+    Stands to parse_dependencies exactly as validate_final_record stands to
+    parse_decomposition: it re-derives every invariant, so a future edit to the
+    parser still cannot put an unanchored or contradictory dependency in the output.
+    An empty list is always valid -- that is the common verdict.
+    """
+    if not isinstance(dependencies, list):
+        raise DecompositionParseError("dep-gate: dependencies is not a list")
+    if not isinstance(sub_questions, list) or not sub_questions:
+        raise DecompositionParseError("dep-gate: sub_questions must be a non-empty list")
+
+    valid = {
+        sq["sub_question_id"]
+        for sq in sub_questions
+        if isinstance(sq, dict) and isinstance(sq.get("sub_question_id"), str)
+    }
+    seen: set[tuple[str, str]] = set()
+    for i, dep in enumerate(dependencies):
+        if not isinstance(dep, dict) or set(dep) != {"depends_on", "dependent"}:
+            found = sorted(dep) if isinstance(dep, dict) else type(dep).__name__
+            raise DecompositionParseError(
+                f"dep-gate: dependencies[{i}] is {found}, expected keys "
+                f"['dependent', 'depends_on']"
+            )
+        source, target = dep["depends_on"], dep["dependent"]
+        if not isinstance(source, str) or not isinstance(target, str):
+            raise DecompositionParseError(f"dep-gate: dependencies[{i}] values must be strings")
+        if source not in valid or target not in valid:
+            raise DecompositionParseError(
+                f"dep-gate: dependencies[{i}] references an id outside {sorted(valid)}"
+            )
+        if source == target:
+            raise DecompositionParseError(f"dep-gate: dependencies[{i}] is a self-dependency")
+        if (source, target) in seen:
+            raise DecompositionParseError(f"dep-gate: duplicate dependency {source}->{target}")
+        if (target, source) in seen:
+            raise DecompositionParseError(
+                f"dep-gate: contradictory dependency {source}->{target}"
+            )
+        seen.add((source, target))
+
+
+@dataclass
+class DependencyJob:
+    """One dependency judgement to ask the model for.
+
+    In batched mode that is a whole query (every pair at once); in pairwise mode it
+    is one pair of a query. Everything downstream works on jobs, so the two modes
+    differ only in how many jobs a record produces and what is in their prompts.
+    """
+
+    query_id: str
+    valid_ids: list[str]                    # every sub_question_id in the record
+    expected_pair: tuple[str, str] | None    # None in batched mode
+    primary: list[dict[str, str]]
+    fallback: list[dict[str, str]]
+
+    def label(self) -> str:
+        return "all pairs" if self.expected_pair is None else "pair %s->%s" % self.expected_pair
+
+
+def _dependency_metadata(record: dict[str, Any]) -> str:
+    """Metadata is legitimately empty for a bare question; say so rather than
+    leaving a dangling 'Metadata:' line the model has to interpret."""
+    return record["query_metadata"].strip() or "(none given)"
+
+
+def _build_batched_job(record: dict[str, Any]) -> DependencyJob:
+    ids = [sq["sub_question_id"] for sq in record["sub_questions"]]
+    fields = {
+        "metadata": _dependency_metadata(record),
+        "sub_questions": "\n".join(
+            f"{sq['sub_question_id']}. {sq['sub_question_text']}" for sq in record["sub_questions"]
+        ),
+        "ids": ", ".join(ids),
+    }
+    return DependencyJob(
+        query_id=record["query_id"],
+        valid_ids=ids,
+        expected_pair=None,
+        primary=[
+            {"role": "system", "content": DEPENDENCY_SYSTEM_PROMPT},
+            {"role": "user", "content": DEPENDENCY_USER_TEMPLATE.format(**fields)},
+        ],
+        fallback=[{"role": "user", "content": DEPENDENCY_FALLBACK_PROMPT.format(**fields)}],
+    )
+
+
+def _build_pairwise_jobs(record: dict[str, Any]) -> list[DependencyJob]:
+    ids = [sq["sub_question_id"] for sq in record["sub_questions"]]
+    text_by_id = {sq["sub_question_id"]: sq["sub_question_text"] for sq in record["sub_questions"]}
+    jobs: list[DependencyJob] = []
+    # combinations() rather than a hardcoded (ids[0], ids[1]): for the current
+    # at-most-2 dataset this yields the single pair, and it does not fall over if a
+    # future TSV produces a 3-sub-question query.
+    for id_a, id_b in combinations(ids, 2):
+        fields = {
+            "metadata": _dependency_metadata(record),
+            "id_a": id_a,
+            "text_a": text_by_id[id_a],
+            "id_b": id_b,
+            "text_b": text_by_id[id_b],
+        }
+        jobs.append(
+            DependencyJob(
+                query_id=record["query_id"],
+                valid_ids=ids,
+                expected_pair=(id_a, id_b),
+                primary=[
+                    {"role": "system", "content": DEPENDENCY_PAIRWISE_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": DEPENDENCY_PAIRWISE_USER_TEMPLATE.format(**fields),
+                    },
+                ],
+                fallback=[
+                    {"role": "user", "content": DEPENDENCY_PAIRWISE_FALLBACK_PROMPT.format(**fields)}
+                ],
+            )
+        )
+    return jobs
+
+
+def build_dependency_prompts(
+    records: Iterable[dict[str, Any]], pairwise_api: bool
+) -> list[DependencyJob]:
+    """The one and only branch point between the two PAIRWISE_API modes.
+
+    A record with fewer than two sub-questions has no pair to judge, so it produces
+    no job at all and gets `dependencies: []` without costing a generation.
+    """
+    jobs: list[DependencyJob] = []
+    for record in records:
+        if len(record["sub_questions"]) < 2:
+            continue
+        if pairwise_api:
+            jobs.extend(_build_pairwise_jobs(record))
+        else:
+            jobs.append(_build_batched_job(record))
+    return jobs
+
+
+def _join_raw(indices: list[int], raw_by_index: dict[int, str], jobs: list[DependencyJob]) -> str:
+    """Flatten a query's raw dependency outputs into one field for the flagged file.
+
+    A batched query has exactly one; a pairwise query has one per pair, so each is
+    labelled with the pair it came from.
+    """
+    parts = [(i, raw_by_index[i]) for i in indices if i in raw_by_index]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0][1]
+    return "\n---\n".join(f"[{jobs[i].label()}] {raw}" for i, raw in parts)
+
+
+def detect_dependencies(
+    llm,
+    tokenizer,
+    records: list[dict[str, Any]],
+    batch_size: int,
+    pairwise_api: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Attach a validated `dependencies` field to every record, in this same run.
+
+    Reuses the loaded model rather than a second session -- same weights, same
+    tokenizer, different prompt. Returns (good, flagged, stats): `good` records have
+    gained a `dependencies` key and are ready to write; `flagged` records failed both
+    attempts and carry the existing flagged-file shape with
+    failure_stage="dependency-detection", their decomposition intact so nothing that
+    already succeeded is thrown away.
+    """
+    jobs = build_dependency_prompts(records, pairwise_api)
+    logger.info(
+        "dependency detection: %d record(s) -> %d LLM call(s) (%s mode)",
+        len(records), len(jobs), "pairwise" if pairwise_api else "batched",
+    )
+
+    parsed: dict[int, list[dict[str, str]]] = {}
+    reasons: dict[int, str] = {}
+    raw_primary: dict[int, str] = {}
+    raw_fallback: dict[int, str] = {}
+
+    # --- attempt 1 ----------------------------------------------------------
+    outputs = run_inference(
+        llm, tokenizer, [job.primary for job in jobs], batch_size,
+        max_tokens=DEPENDENCY_MAX_TOKENS,
+    )
+    retry: list[int] = []
+    for i, (job, raw) in enumerate(zip(jobs, outputs)):
+        raw_primary[i] = raw
+        try:
+            parsed[i] = parse_dependencies(raw, job.valid_ids, job.expected_pair)
+        except DecompositionParseError as exc:
+            reasons[i] = f"primary: {exc}"
+            retry.append(i)
+    logger.info("dependency pass 1: %d parsed, %d need retry", len(parsed), len(retry))
+
+    # --- attempt 2: fallback prompt for the failures ------------------------
+    fallback_ok: set[str] = set()
+    if retry:
+        outputs = run_inference(
+            llm, tokenizer, [jobs[i].fallback for i in retry], batch_size,
+            max_tokens=DEPENDENCY_MAX_TOKENS,
+        )
+        for i, raw in zip(retry, outputs):
+            raw_fallback[i] = raw
+            job = jobs[i]
+            try:
+                parsed[i] = parse_dependencies(raw, job.valid_ids, job.expected_pair)
+                fallback_ok.add(job.query_id)
+                logger.info(
+                    "query %s (%s): dependencies recovered via fallback prompt",
+                    job.query_id, job.label(),
+                )
+            except DecompositionParseError as exc:
+                reasons[i] = f"{reasons[i]} | fallback: {exc}"
+
+    # --- merge per query, gate, and route -----------------------------------
+    jobs_by_query: dict[str, list[int]] = {}
+    for i, job in enumerate(jobs):
+        jobs_by_query.setdefault(job.query_id, []).append(i)
+
+    good: list[dict[str, Any]] = []
+    flagged: list[dict[str, Any]] = []
+    for record in records:
+        indices = jobs_by_query.get(record["query_id"], [])
+        failed = [i for i in indices if i not in parsed]
+        dependencies: list[dict[str, str]] | None = None
+        reason = ""
+
+        if failed:
+            reason = " || ".join(
+                f"[{jobs[i].label()}] {reasons.get(i, 'unknown')}" for i in failed
+            )
+        else:
+            # In pairwise mode this concatenates one verdict per pair; in batched
+            # mode there is a single verdict. Either way the gate re-checks the
+            # merged list, which is where a cross-pair contradiction would surface.
+            merged = [dep for i in indices for dep in parsed[i]]
+            try:
+                validate_dependencies(merged, record["sub_questions"])
+                dependencies = merged
+            except DecompositionParseError as exc:
+                reason = f"dependency final-gate: {exc}"
+
+        if dependencies is not None:
+            record["dependencies"] = dependencies
+            good.append(record)
+            continue
+
+        fallback_ok.discard(record["query_id"])   # it was not, in the end, recovered
+        flagged.append(
+            {
+                "query_id": record["query_id"],
+                "comp_query": record["comp_query"],
+                "query_metadata": record["query_metadata"],
+                "sub_questions": record["sub_questions"],
+                # Same key names as a decomposition failure -- failure_stage says
+                # which stage these raw outputs came from.
+                "first_attempt_raw_output": _join_raw(indices, raw_primary, jobs),
+                "fallback_attempt_raw_output": _join_raw(indices, raw_fallback, jobs),
+                "failure_stage": "dependency-detection",
+                "failure_reason": reason or "unknown",
+            }
+        )
+
+    stats = {
+        "mode": "pairwise" if pairwise_api else "batched",
+        "calls": len(jobs),
+        "fallback_recovered": len(fallback_ok),
+        "flagged": len(flagged),
+        "with_dependency": sum(1 for record in good if record["dependencies"]),
+    }
+    return good, flagged, stats
+
+
+# --------------------------------------------------------------------------------
 # 2. MODEL / INFERENCE
 # --------------------------------------------------------------------------------
 
@@ -506,18 +1194,26 @@ def _render(tokenizer, conversation: list[dict[str, str]]) -> str:
     )
 
 
-def run_inference(llm, tokenizer, conversations: list[list[dict[str, str]]], batch_size: int) -> list[str]:
+def run_inference(
+    llm,
+    tokenizer,
+    conversations: list[list[dict[str, str]]],
+    batch_size: int,
+    max_tokens: int = MAX_TOKENS,
+) -> list[str]:
     """Batch every prompt through vLLM's offline API.
 
     One generate() call over the whole list is the point of using vLLM here: the
     scheduler batches continuously, so per-prompt calls would waste most of the GPU.
+    `max_tokens` defaults to the decomposition budget; the dependency stage passes
+    its own, much smaller one.
     """
     from vllm import SamplingParams
 
     if not conversations:
         return []
     sampling = SamplingParams(
-        temperature=TEMPERATURE, top_p=TOP_P, max_tokens=MAX_TOKENS, seed=SEED
+        temperature=TEMPERATURE, top_p=TOP_P, max_tokens=max_tokens, seed=SEED
     )
     prompts = [_render(tokenizer, c) for c in conversations]
     chunk = batch_size if batch_size and batch_size > 0 else len(prompts)
@@ -551,12 +1247,17 @@ def write_flagged(path: str | Path, flagged: list[dict[str, Any]]) -> None:
 
 
 def write_error_log(path: str | Path, flagged: list[dict[str, Any]]) -> None:
+    """One log for the whole script. failure_stage separates a decomposition failure
+    ("parser" / "final-gate") from a dependency one ("dependency-detection"), which
+    matters when scanning: the latter still has a usable decomposition behind it."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         if not flagged:
-            fh.write("No queries failed decomposition.\n")
+            fh.write("No queries failed decomposition or dependency detection.\n")
             return
-        fh.write(f"{len(flagged)} query/queries failed decomposition\n\n")
+        by_stage = Counter(record.get("failure_stage", "?") for record in flagged)
+        breakdown = ", ".join(f"{count} {stage}" for stage, count in sorted(by_stage.items()))
+        fh.write(f"{len(flagged)} query/queries failed ({breakdown})\n\n")
         for record in flagged:
             fh.write(
                 f"{record['query_id']}\t{record.get('failure_stage','?')}\t"
@@ -582,6 +1283,13 @@ def parse_args() -> argparse.Namespace:
                         help='float, or "auto" to fit alongside other GPU jobs')
     parser.add_argument("--max-model-len", type=int, default=MAX_MODEL_LEN)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument(
+        "--pairwise-api", dest="pairwise_api", action=argparse.BooleanOptionalAction,
+        default=PAIRWISE_API,
+        help="judge dependencies one sub-question pair per LLM call instead of all "
+             "of a query's pairs in one call (identical while queries have <= 2 "
+             "sub-questions)",
+    )
     parser.add_argument("--limit", type=int, default=None, help="only process the first N topics")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
@@ -654,7 +1362,7 @@ def main() -> None:
                 )
 
     # --- final gate ---------------------------------------------------------
-    good: list[dict[str, Any]] = []
+    passed: list[dict[str, Any]] = []
     flagged: list[dict[str, Any]] = []
     for topic in topics:
         record = records.get(topic.query_id)
@@ -662,7 +1370,7 @@ def main() -> None:
         if record is not None:
             try:
                 validate_final_record(record)
-                good.append(record)
+                passed.append(record)
                 continue
             except DecompositionParseError as exc:
                 stage = "final-gate"
@@ -678,6 +1386,19 @@ def main() -> None:
             }
         )
 
+    # --- step 1b: dependency detection, same run, same model session ---------
+    # Every record that cleared the gate above is judged here and gains its
+    # `dependencies` field before anything is written, so the file below is complete
+    # on its first write. Records that fail both attempts move to `flagged` instead.
+    good, dependency_flagged, dep_stats = detect_dependencies(
+        llm, tokenizer, passed, args.batch_size, args.pairwise_api
+    )
+    flagged.extend(dependency_flagged)
+    # Dependency failures are appended after the decomposition ones; re-sort so the
+    # flagged file still reads in topic order.
+    topic_order = {topic.query_id: i for i, topic in enumerate(topics)}
+    flagged.sort(key=lambda record: topic_order.get(record["query_id"], len(topic_order)))
+
     write_output(args.output, good)
     write_flagged(args.flagged, flagged)
     write_error_log(args.error_log, flagged)
@@ -688,11 +1409,21 @@ def main() -> None:
     if missing:
         logger.error("BUG: %d query_id(s) unaccounted for: %s", len(missing), sorted(missing)[:10])
 
+    # Decomposition counts are taken from `passed`, not `good`: a record can clear
+    # decomposition and still be diverted by the dependency stage.
+    passed_ids = {record["query_id"] for record in passed}
+    recovered = sum(1 for query_id in fallback_ok if query_id in passed_ids)
+
     print()
     print(f"  topics read                : {len(topics)}")
-    print(f"  succeeded (first attempt)  : {len(good) - len(fallback_ok)}")
-    print(f"  succeeded (after fallback) : {len(fallback_ok)}")
+    print(f"  succeeded (first attempt)  : {len(passed) - recovered}")
+    print(f"  succeeded (after fallback) : {recovered}")
+    print(f"  dependency mode            : {dep_stats['mode']} ({dep_stats['calls']} LLM calls)")
+    print(f"  dependency fallbacks used  : {dep_stats['fallback_recovered']}")
+    print(f"  records with a dependency  : {dep_stats['with_dependency']}")
+    print(f"  flagged (dependency stage) : {dep_stats['flagged']}")
     print(f"  flagged / unresolved       : {len(flagged)}")
+    print(f"  written to main output     : {len(good)}")
     print(f"  main output                : {args.output}")
     if flagged:
         print(f"  flagged output             : {args.flagged}")

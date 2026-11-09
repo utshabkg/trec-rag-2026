@@ -1,0 +1,61 @@
+{#-
+  Prompt for the sentence-cited RAG answer.
+
+  Every instruction below was an observed failure in a real 119-narrative run --
+  see WORK_LOG.md 4.5 and 5.1. Do not trim them for brevity; each one is load
+  bearing. Counts quoted in the text are the measured incidence.
+
+  Variables:
+    question              str   the narrative (in decomposed mode it already
+                                carries its extracted sub-questions)
+    passages              list  {index, text} in evidence order, strongest first
+    max_words             int   hard ceiling from the track guidelines
+    max_citations         int   per-sentence citation cap
+    target_low/target_high int  soft word target
+    thinking              bool  ask for a <think> block first
+    revision              obj   None on the first attempt; on a retry carries
+                                .issues (list[str]) and .instructions (list[str])
+-#}
+You are writing a grounded, cited answer to a research question using only the evidence passages below.
+
+Question: {{ question }}
+
+Evidence passages:
+{% for passage in passages %}
+[{{ passage.index }}] {{ passage.text }}
+{% endfor %}
+{% if revision %}
+
+REVISION REQUIRED. A previous draft of this answer was checked against the evidence and rejected. What was wrong with it:
+{% for issue in revision.issues %}
+- {{ issue }}
+{% endfor %}
+
+Fix all of the above in this draft:
+{% for instruction in revision.instructions %}
+- {{ instruction }}
+{% endfor %}
+Write a complete new answer. Do not refer to the previous draft or to these corrections.
+{% endif %}
+{% if thinking %}
+
+Think first, inside a single <think> block, then give your answer. Work through these steps in the block:
+1. List every distinct thing the request asks for. These narratives bundle several asks, and coverage of all of them is what the answer is scored on.
+2. For each ask, note which passage numbers actually carry evidence for it.
+3. Note any ask whose evidence is thin or missing, and decide what conditional guidance the evidence does support for it.
+4. Budget your sentences across the asks so no single ask consumes the answer. Breadth beats depth here.
+5. Confirm each claim you plan to make traces to a specific passage you will cite for it.
+
+Keep the block short -- notes, not prose. Close it with </think>, then emit only the JSON array. Nothing outside the block and the array.
+{% endif %}
+
+Write a thorough answer of {{ target_low }}-{{ target_high }} words (hard maximum {{ max_words }}), as a JSON array of objects with "text" and "citations".
+Identify every distinct sub-question the request asks and address each one explicitly; breadth of coverage matters more than depth on any single point.
+Write the answer itself. Do not restate or summarise the question, and do not describe what the request is asking -- 21 of 119 answers opened with 'The question asks...', which wastes the word budget and reads poorly to a judge.
+Never mention the evidence passages as objects. Write 'Subletting can be a viable option', not 'Passage [6] notes that subletting...'. The citation field carries attribution; the prose must not.
+Answer in the register the request asks for: if it asks for an outline, a blog post, a script or a one-pager, produce that artefact rather than describing what one would contain.
+Address the person's stated situation and constraints directly, using their terms.
+Where the evidence is thin, give the best conditional guidance it supports ('prioritise X if A, otherwise Y') instead of stating that the evidence is insufficient.
+"citations" must be a list of at most {{ max_citations }} zero-based indices into the evidence passages above, ordered strongest support first.
+Every sentence must be supported by at least one cited passage. Do not invent facts absent from the evidence.
+Respond with only the JSON array, e.g. [{"text": "...", "citations": [0, 2]}].

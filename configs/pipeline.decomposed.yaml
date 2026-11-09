@@ -1,0 +1,293 @@
+# TREC RAG 2026 — per-AIN decomposed pipeline.
+#
+# Same cascade and same backends as `configs/pipeline.gpu.yaml`; the difference
+# is the `decomposition:` block at the bottom, which makes the runner fan the
+# cascade out over each narrative's atomic information needs and pool the
+# results instead of running one composite query.
+#
+# Requires the step-3 preprocessor output for THESE topics (see `decomposition.path`).
+# Run with:
+#   python scripts/run_pipeline.py --config configs/pipeline.decomposed.yaml \
+#       --topics <topics.tsv> --team-id iris-mst --run-id decomposed-cascade
+pyserini:
+  base_url: "http://api.castorini.uwaterloo.ca"
+  index: "climbmix-400b"
+  token_env: "PYSERINI_API_TOKEN"
+  timeout_seconds: 60
+  max_retries: 6
+  # The API is rate-limited. Retries honour Retry-After and otherwise back off
+  # 2s, 4s, 8s, ... so a 429 burst waits rather than hammering.
+  backoff_factor: 2.0
+  # Search responses are cached by (index, query, hits) so a resumed or repeated
+  # run never re-hits shared track infrastructure. MEASURED at ~63 MB per topic
+  # (ClimbMix returns whole documents), so budget ~7.5 GB for all 119.
+  cache_dir: "/media/12TB/shared/datasets/trec/trec-rag-2026/pyserini_cache"
+
+stages:
+  bm25:
+    # The cache key includes `hits`, so changing this invalidates every cached
+    # payload and re-issues 119 x 1000-hit searches. Pin it.
+    hits: 1000
+
+  passage_selection:
+    # ClimbMix documents are whole pages/books: measured mean 66,685 chars,
+    # median 42,948, and NOT ONE of 1000 candidates was under 2000 chars. Every
+    # downstream stage truncates its input, so without this they all score and
+    # cite each document's title page. Measured over 200 real candidates: the
+    # leading window was the best window in only 10/200 docs, the median best
+    # window began at char 15,900, and selecting it raised query overlap 32%.
+    # CPU-only, ~1.7s per 1000-candidate topic.
+    enabled: true
+    window_chars: 2000        # ~512 tokens, matching the e5/CE input limits
+    stride_chars: 1000
+    windows_per_doc: 2        # narratives are multi-faceted; one span rarely covers them
+    min_doc_chars: 2000       # already passage-sized: leave untouched
+
+  biencoder:
+    enabled: true
+    backend: sentence_transformer
+    model_name: "intfloat/e5-base-v2"
+    # E5 is trained with these markers; omitting them measurably costs accuracy.
+    query_prefix: "query: "
+    passage_prefix: "passage: "
+    device: "cuda"
+    batch_size: 128
+    dims: 768
+    pool_size: 1000
+
+  hybrid:
+    rrf_k: 60
+    top_k: 500
+
+  ltr:
+    # DISABLED: provably a no-op here. It reranks 500 -> 500 (no truncation, since
+    # hybrid emits 500), and the cross-encoder then re-sorts every candidate by its
+    # own score, so LTR's ordering is discarded wholesale. Verified empirically:
+    # 5/5 topics produce byte-identical final rankings with it on or off. There is
+    # also no trained model (zero-shot), so the linear fallback is only reordering
+    # by a weighted sum of signals the cross-encoder supersedes.
+    enabled: false
+    model_path: null            # no dev qrels trained yet -> linear fallback
+    feature_names: ["bm25_score", "bm25_rank", "bien_score", "bien_rank", "rrf_score"]
+    weights:
+      bm25_score: 0.25
+      bien_score: 0.25
+      rrf_score: 0.5
+    top_k: 500                  # reorder the whole RRF pool; don't discard yet
+
+  colbert:
+    # DISABLED deliberately. There is no real ColBERT backend available here:
+    # no checkpoint is cached, and loading colbert-ir/colbertv2.0 through
+    # AutoModel would skip its projection head and score raw BERT hidden states
+    # while calling it ColBERT. Its only remaining function would be to prune
+    # the pool with lexical token overlap *before* the strongest scorer sees it.
+    # Batched, the cross-encoder handles 500 candidates in 0.24s, so that
+    # pruning buys no time and can only lose recall. `top_k` is kept at the pool
+    # size so the disabled stage truncates nothing.
+    enabled: false
+    backend: hashing
+    model_name: null
+    device: "cuda"
+    batch_size: 32
+    max_query_tokens: 32
+    max_doc_tokens: 180
+    top_k: 500
+
+  cross_encoder:
+    enabled: true
+    backend: sentence_transformer
+    model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    device: "cuda"
+    batch_size: 64
+    top_k: 50                   # the set handed to listwise reranking + the R run
+
+  llm_listwise:
+    enabled: true
+    backend: openai             # Ollama's OpenAI-compatible endpoint
+    model_env: "LLM_LISTWISE_MODEL"
+    window_size: 20
+    step: 10
+    # Raised from 300 now that passage_selection guarantees these chars are the
+    # query-relevant span rather than the document's opening boilerplate.
+    max_passage_chars: 1200
+    # Returns all 50 so the R run keeps its depth, but only LLM-reranks the head.
+    # This stage is ~85% of runtime (one call per sliding window), and the head is
+    # what becomes the generator's evidence; below it the cross-encoder ordering is
+    # already reasonable. 50 candidates = 4 windows; 20 = 1. The tail is spliced
+    # back in cross-encoder order.
+    rerank_depth: 20
+    top_k: 50
+
+retrieval_output:
+  filename: "r_output_trec_rag_2026.tsv"
+  # The R task wants a per-narrative k of "all and only" useful documents, so
+  # this is the cross-encoder survivor set rather than a padded round number.
+  depth: 50
+
+generation:
+  backend: llm
+  llm_backend: openai
+  filename: "rag_output_trec_rag_2026.jsonl"
+  evidence_k: 10
+  max_words: 1024
+  max_citations_per_sentence: 3
+
+  # Ask for a <think> block before the JSON. The block is stripped from the
+  # response by strip_reasoning() and never reaches the submission.
+  #
+  # CAUTION, and the reason this is off in pipeline.gpu.yaml: WORK_LOG.md 4.4
+  # records reasoning tokens corrupting BOTH parsers -- the listwise reranker
+  # reads every integer as a rank, the generator takes the first bracketed span
+  # as JSON, and a think block supplies plenty of both. That is survivable only
+  # because strip_reasoning now also drops an UNTERMINATED block to end of
+  # string; a block cut off by the token budget keeps no closing tag. Which is
+  # also why max_tokens grows below when this is on -- the think block is spent
+  # before the JSON is emitted.
+  thinking: true
+
+  # Total output budget. Left unset it is 4096, or 6144 when thinking is on.
+  # max_tokens: 6144
+
+  verification:
+    # Check each draft against its evidence, and regenerate once with the
+    # specific gap named if it fails. Set false to disable entirely (the code
+    # default), which restores single-pass generation exactly.
+    #
+    # COST: a failed check costs one extra full generation. Generation is
+    # already 34.1s of a 50.6s narrative, so a run where every draft fails is
+    # ~1.7x. The lexical backend itself is free.
+    enabled: true
+
+    # lexical = deterministic, no API call. Add "llm" for a judging call per
+    # answer that catches paraphrase-level fabrication overlap cannot -- at a
+    # second generation-sized call on the dominant stage. Ordered cheapest
+    # first and short-circuiting.
+    backends: ["lexical"]
+
+    # 2 = one draft plus one corrected retry. The retry is the draft that
+    # carries the verifier's instructions; a third rarely differs enough.
+    max_attempts: 2
+
+    # Fraction of a sentence's content words that must appear in a passage it
+    # cites. A FLOOR, not a similarity score: legitimate paraphrase drops
+    # overlap, so raising this starts rejecting good answers and paying for a
+    # regeneration that buys nothing.
+    min_overlap: 0.25
+
+    # Tolerated share of ungrounded sentences before the draft is rejected.
+    max_ungrounded_ratio: 0.34
+
+    # Share of supplied evidence that must be cited somewhere. Catches the
+    # measured coverage failure (WORK_LOG 5.2): ~9.5 sentences whether the
+    # narrative asks 3 things or 18, with the missing material sitting in
+    # documents the answer already had.
+    min_evidence_used: 0.5
+
+    check_hallucination: true
+    check_omission: true
+
+    # Ask the LLM judge to reason inside a <think> block before reporting.
+    # Only affects the "llm" backend; the lexical one does no prompting.
+    # Same caution as generation.thinking, and sharper here: the judgment is
+    # two lines, so a truncated think block yields an EMPTY judgment, which is
+    # read as "answer passed" -- verification switches itself off rather than
+    # failing loudly. max_tokens rises 512 -> 1536 when this is on to cover it.
+    thinking: true
+    # max_tokens: 1536
+
+    # A judgement the verifier cannot read is passed through, NOT failed --
+    # rejecting on its own parse errors would regenerate good answers and ship
+    # the last draft anyway. The hazard is that this looks identical to a clean
+    # verdict, so a broken judge produces a run of unverified answers that
+    # reads as a run of clean ones.
+    #
+    # Guards against that: each unreadable judgement is logged per topic, and
+    # after this many CONSECUTIVE ones the verifier declares itself broken,
+    # logs an ERROR naming the likely cause, and stops making calls (they cost
+    # a generation-sized request each to learn nothing).
+    max_consecutive_unparsable: 3
+
+    # true = raise instead of degrading, so a misconfigured verifier stops the
+    # run rather than producing a submission that only looks verified. Left
+    # false here because an aborted run costs more than an unverified one this
+    # close to the deadline -- flip it when there is time to fix and re-run.
+    strict: false
+
+llm:
+  base_url_env: "LLM_BASE_URL"
+  api_key_env: "LLM_API_KEY"
+  model_env: "LLM_MODEL"
+  # Ollama is shared: if another process has a different model resident, our
+  # request blocks behind a multi-GB model swap. Observed 578s for one topic and
+  # a 300s read timeout on another, each costing the whole topic.
+  timeout_seconds: 900
+  max_attempts: 3
+  retry_backoff_seconds: 10.0
+
+decomposition:
+  # Step-3 preprocessor output. NOTE this file must cover the topics being run:
+  # the committed one covers the 119 TEST narratives (rag2026-*) only, not the
+  # 22 dev topics, whose ids are plain integers.
+  path: "output_decomp/preprocessed_queries_step3.jsonl"
+
+  # Which reformulation to retrieve each need with. Falls back down the chain
+  # step3c -> step3b -> step3a -> raw ain_text when the requested one is absent.
+  # step3c is currently unavailable everywhere: PRF has not been run, and the
+  # loader treats a "disabled" status as absent rather than trusting the field
+  # (with no PRF terms the 3C string is a verbatim copy of the 3B one, so
+  # reading it would report a PRF run that never happened).
+  query_variant: "step3b_expanded_query"
+
+  per_ain:
+    # NOT 1000. A ClimbMix response at hits=1000 is ~63 MB; ~10.7 needs per
+    # narrative over 119 narratives would be ~80 GB of new cache. At 100 it is
+    # ~6.3 MB, and only the top few survive per need anyway.
+    # UNTESTED ASSUMPTION: WORK_LOG.md §5.3 measured depth 1000 as load-bearing
+    # for the COMPOSITE query, where BM25 rank barely predicts final relevance.
+    # A need is narrow and precise, so the argument is weaker here -- but that
+    # has not been measured. Raise this first if recall looks thin.
+    bm25_hits: 100
+    top_k: 5                  # documents kept per need
+
+  fusion:
+    rrf_k: 60
+    # The composite run is one list against ~10.7 need lists, so at weight 1.0
+    # it holds ~1/12 of the vote purely by being outnumbered. Raise this to give
+    # the whole-narrative view more say.
+    composite_weight: 1.0
+    top_k: 100                # pooled list handed to the single listwise pass
+
+  # Fuse the composite cascade into the pool. At composite_weight 1.0 this is not
+  # a floor: a composite-only document at rank 6 or below scores less than any
+  # need hit (1/66 against at least 1/65), so the pool cap can cut it.
+  include_composite_run: true
+
+  # Runaway guard. null = no cap. When set, needs are taken round-robin across
+  # sub-questions, never by truncating the flat list (which would drop a
+  # narrative's last sub-questions entirely).
+  max_ains: null
+
+  generation:
+    # Choose the generator's evidence to span sub-questions instead of taking the
+    # pool's head. Fusion rewards agreement and needs cluster inside
+    # sub-questions, so rank order skews evidence toward whichever sub-question
+    # spawned the most needs -- which would reproduce the coverage failure in
+    # WORK_LOG.md 5.2 (~9.5 sentences whether a narrative asks 3 things or 18)
+    # on top of a decomposed pool. Set false to A/B against plain rank order.
+    coverage_aware_evidence: true
+
+    # Floor on evidence_k, as a multiple of the narrative's sub-question count;
+    # never reduces it. INERT AT 1 on today's data (the widest narrative has 8
+    # sub-questions against generation.evidence_k of 10) -- it exists so the
+    # floor is principled rather than a flat bump, which ARCHITECTURE.md 4.3
+    # deliberately held off on: postprocess truncation is greedy and
+    # coverage-blind, so extra evidence can be new facts or just padding and
+    # nothing yet distinguishes them.
+    evidence_per_sub_question: 1
+
+    # Append the step-1 sub-questions to the generation prompt. The prompt
+    # already says "address each one explicitly"; this supplies the list instead
+    # of making the model re-derive it from a dense paragraph at generation time.
+    # Does NOT affect the submission's metadata.narrative field, which comes from
+    # the topics TSV and is checked byte-for-byte by validate_rag_jsonl.
+    include_sub_questions_in_prompt: true
