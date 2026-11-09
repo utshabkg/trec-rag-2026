@@ -52,8 +52,9 @@ where it loses, and the config says "raise this first if recall looks thin".
 
 **Raised it to 1000 and it got worse, not better** (`pipeline.decomposed.hits1000.yaml`,
 one substantive line different; it also lifts the per-need RRF pool 100 -> 500 via
-`hybrid_top_k = min(500, bm25_hits)`). Dev run: 22 topics, 60 min, 146/146 needs
-retrieved, so the arm ran at full strength.
+`hybrid_top_k = min(500, bm25_hits)`). Dev run: 22 topics, 171/171 needs
+retrieved over two sessions (the second resumed with 3 topics checkpointed and ran
+the other 19, 146 needs, in 60 min), so the arm ran at full strength.
 
 | metric | Δ vs hits=100 (3 assessors) | Δ vs composite |
 |---|---|---|

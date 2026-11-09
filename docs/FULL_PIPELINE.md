@@ -44,12 +44,12 @@ flowchart TB
     N --> A2["need 2<br/>BM25 100 → CE → top 5"]
     N --> AN["need n<br/>≈ 10.7 per narrative"]
 
-    COMP -->|"floor: baseline finds<br/>are never lost"| F
+    COMP -->|"composite run: one list,<br/>weight 1.0"| F
     A1 --> F
     A2 --> F
     AN --> F
 
-    F["weighted RRF → pool 100<br/>stamps n_ain_hits, n_sub_question_hits,<br/>ain_hit_sq*, from_composite"]
+    F["RRF → pool 100<br/>stamps n_ain_hits, n_sub_question_hits,<br/>ain_hit_sq*, from_composite"]
     F --> L["LLM listwise — ONCE<br/>ordered against the narrative → 50"]
     L --> RUN(["R run @ 50"])
     L --> EV["coverage-aware evidence<br/>round-robin across sub-questions<br/>→ 10"]
@@ -129,7 +129,7 @@ Two things that are easy to get wrong:
 |---|---|
 | `schema.py` | `AtomicNeed` / `SubQuestion` / `DecomposedTopic`; emits plain `Topic`s so the cascade runs unmodified. `query_text()` degrades 3C → 3B → 3A → raw. |
 | `loader.py` | Step-3 JSONL → objects. **Joins `ain` to `expanded_queries` on `(sub_question_id, ain_id)` and raises on any misalignment** — the two blocks come from separate script runs, and a bad join retrieves a well-formed query for the wrong need with nothing downstream able to notice. |
-| `fusion.py` | Weighted RRF over per-need runs + the composite run. Stamps `n_ain_hits`, `n_sub_question_hits`, `ain_hit_sq<id>`, `from_composite`. |
+| `fusion.py` | RRF over per-need runs + the composite run, every list at weight 1.0. Stamps `n_ain_hits`, `n_sub_question_hits`, `ain_hit_sq<id>`, `from_composite`. |
 | `evidence.py` | Coverage-aware evidence selection (below). |
 | `orchestrator.py` | `DecomposedPipeline` — same `run_topic()` contract as `RagPipeline`. |
 

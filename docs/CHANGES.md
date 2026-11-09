@@ -29,7 +29,7 @@ New files:
 |---|---:|---|
 | `src/trecrag/decomposed/schema.py` | 129 | `AtomicNeed` / `SubQuestion` / `DecomposedTopic` |
 | `src/trecrag/decomposed/loader.py` | 198 | step-3 JSONL → objects, with the alignment gate |
-| `src/trecrag/decomposed/fusion.py` | 101 | cross-AIN weighted RRF + provenance features |
+| `src/trecrag/decomposed/fusion.py` | 101 | cross-AIN RRF + provenance features |
 | `src/trecrag/decomposed/evidence.py` | 106 | coverage-aware evidence selection |
 | `src/trecrag/decomposed/orchestrator.py` | 247 | `DecomposedPipeline` |
 | `src/trecrag/decomposed/__init__.py` | 34 | public surface |
@@ -83,11 +83,13 @@ order candidate sets that are about to be merged anyway. Implemented by building
 the per-need cascade with `llm_listwise=None` and holding the reranker at the
 orchestrator.
 
-**The composite run is fused in as a floor.** Whatever the baseline already
-finds stays in the pool, so decomposition can add recall but not silently lose
-it. `reciprocal_rank_fusion` gained an optional `weights=` argument for this —
-one composite list against ~11 per-need lists would otherwise hold a ~1/12 vote
-purely by being outnumbered.
+**The composite run is fused into the pool, but it is not a floor.** At
+`composite_weight: 1.0` a composite-only document at rank 6 or below scores less
+than any need hit (1/66 against at least 1/65), so the pool cap can cut it, and
+most such documents do not reach the submitted 50. `reciprocal_rank_fusion`
+gained an optional `weights=` argument to change that balance. At weight 1.0, one
+composite list against ~11 per-need lists holds a ~1/12 vote purely by being
+outnumbered.
 
 **Both cascades share model instances.** The factory builds e5 and the
 cross-encoder once and constructs two `RagPipeline` objects over them; calling

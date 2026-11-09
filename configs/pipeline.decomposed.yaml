@@ -257,8 +257,9 @@ decomposition:
     composite_weight: 1.0
     top_k: 100                # pooled list handed to the single listwise pass
 
-  # Keep the composite cascade as a floor: whatever the baseline already finds
-  # stays in the pool, so decomposition can add recall but not silently lose it.
+  # Fuse the composite cascade into the pool. At composite_weight 1.0 this is not
+  # a floor: a composite-only document at rank 6 or below scores less than any
+  # need hit (1/66 against at least 1/65), so the pool cap can cut it.
   include_composite_run: true
 
   # Runaway guard. null = no cap. When set, needs are taken round-robin across

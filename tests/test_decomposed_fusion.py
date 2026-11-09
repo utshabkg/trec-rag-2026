@@ -54,9 +54,9 @@ class TestNeedProvenance(unittest.TestCase):
         self.assertEqual(by_docid["b"].features["from_composite"], 1.0)
         self.assertEqual(by_docid["z"].features["from_composite"], 1.0)
 
-    def test_composite_only_documents_survive_into_the_pool(self):
-        # The floor guarantee: the baseline's finds are never dropped merely
-        # because no single need surfaced them.
+    def test_composite_only_documents_survive_into_an_uncapped_pool(self):
+        # With no top_k the fused list keeps every composite-only document. A
+        # pool cap can still cut them, so this is not a floor on the final list.
         fused = fuse_ain_runs([_run("a")], composite_run=_cands("z"))
         self.assertIn("z", {c.docid for c in fused})
 
