@@ -106,7 +106,7 @@ Request a Pyserini API token by emailing `get-pyserini@googlegroups.com`.
 python scripts/run_pipeline.py \
   --topics trec_rag_2026_test_query_set.tsv \
   --config configs/pipeline.gpu.yaml \
-  --team-id iris-mst --run-id bruteforce-cascade \
+  --team-id iris --run-id bruteforce-cascade \
   --out-dir output/
 ```
 
@@ -124,7 +124,7 @@ byobu new-session -d -s trecrag 'bash -lc "
   python scripts/run_pipeline.py \
     --topics trec_rag_2026_test_query_set.tsv \
     --config configs/pipeline.gpu.yaml \
-    --team-id iris-mst --run-id bruteforce-cascade \
+    --team-id iris --run-id bruteforce-cascade \
     --run-desc \"BM25+e5 biencoder RRF -> LTR -> cross-encoder -> LLM listwise -> LLM generator\" \
     --out-dir output/ --workers 1"'
 byobu attach -t trecrag        # detach with F6
